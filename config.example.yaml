@@ -1,0 +1,43 @@
+# Пример конфигурации для CLI-запуска (zabbix_template_sync.cli).
+# Файл должен быть в UTF-8 (поддержка кириллицы).
+# Скопируйте в config.yaml и заполните своими значениями.
+
+zabbix:
+  url: https://zabbix.example.com
+  user: api-readonly
+  password: "ВАШ_ПАРОЛЬ"
+  verify_ssl: true
+
+gitlab:
+  url: https://gitlab.example.com
+  # Можно числовой ID или URL-encoded путь "group%2Fsubgroup%2Fproject"
+  project_id: "monitoring/zabbix-templates"
+  # Personal Access Token / Project Access Token / Group Access Token
+  # с правами api + write_repository
+  token: "glpat-XXXXXXXXXXXXXXXXXXXX"
+  branch: main
+  verify_ssl: true
+
+sync:
+  # Поддиректория в репозитории, куда складывать шаблоны
+  templates_subdir: templates
+
+  # Сколько секунд должно пройти с момента последнего изменения шаблона
+  # в Zabbix, прежде чем закоммитить его обновление в GitLab.
+  # 3600 = 1 час (требование ТЗ).
+  quiet_period_sec: 3600
+
+  # Опциональные фильтры (закомментируйте, чтобы синхронизировать ВСЕ шаблоны).
+  # template_groups:
+  #   - Templates/Operating systems
+  #   - Шаблоны/СУБД
+  # template_hosts:
+  #   - Linux by Zabbix agent
+  #   - Windows by Zabbix agent
+
+  # true  — все изменения в один атомарный коммит (рекомендуется);
+  # false — отдельный коммит на каждый файл (более «болтливая» история).
+  single_commit: true
+
+  commit_author_name: "Zabbix Sync Bot"
+  commit_author_email: "zabbix-sync@example.com"
