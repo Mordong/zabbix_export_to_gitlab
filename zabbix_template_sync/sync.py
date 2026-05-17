@@ -83,6 +83,19 @@ class TemplateSynchronizer:
         stats = SyncStats()
         now = int(time.time())
 
+        # 0. Pre-flight: проверяем доступ к GitLab проекту ДО подключения к Zabbix.
+        #    Это быстро (один GET) и даёт понятную ошибку, если в config.yaml
+        #    неправильный project_id, токен или ветка. Иначе мы бы сначала
+        #    выкачали все шаблоны из Zabbix и только потом получили 404.
+        gl = GitLabClient(
+            gitlab_url=self.cfg.gitlab_url,
+            project_id=self.cfg.gitlab_project_id,
+            token=self.cfg.gitlab_token,
+            branch=self.cfg.gitlab_branch,
+            verify_ssl=self.cfg.gitlab_verify_ssl,
+        )
+        gl.verify_access()
+
         # 1. Подключаемся к Zabbix и получаем список шаблонов
         zbx = ZabbixAPI(self.cfg.zabbix_url, verify_ssl=self.cfg.zabbix_verify_ssl)
         with zbx:
@@ -96,14 +109,7 @@ class TemplateSynchronizer:
             if not templates:
                 return stats
 
-            # 2. Подключаемся к GitLab и получаем список существующих файлов
-            gl = GitLabClient(
-                gitlab_url=self.cfg.gitlab_url,
-                project_id=self.cfg.gitlab_project_id,
-                token=self.cfg.gitlab_token,
-                branch=self.cfg.gitlab_branch,
-                verify_ssl=self.cfg.gitlab_verify_ssl,
-            )
+            # 2. Список существующих файлов в репозитории
             existing_files = set(gl.list_files(self.cfg.templates_subdir))
             log.info(
                 "В GitLab (%s/%s) уже есть файлов в %s/: %d",
@@ -113,25 +119,64 @@ class TemplateSynchronizer:
                 len(existing_files),
             )
 
-            # 3. Опционально: пакетный запрос в audit log сразу по всем шаблонам.
-            #    Если он недоступен (нет прав / отключён) — fallback на per-template запрос.
-            bulk_audit: dict[str, int] = {}
-            try:
-                bulk_audit = zbx.get_templates_last_modified_bulk(
-                    [t["templateid"] for t in templates]
-                )
-                log.info("Audit log: получено записей по %d шаблонам", len(bulk_audit))
-            except Exception as e:  # noqa: BLE001
-                log.warning("Bulk auditlog.get не сработал: %s", e)
+            # 3. Audit log: один лёгкий запрос за окно «2 × quiet_period» (с запасом).
+            #    Получаем словарь {templateid: latest_clock} для НЕДАВНО изменённых.
+            #    Шаблоны, отсутствующие в словаре, считаем «стабильными»
+            #    (их давно никто не трогал).
+            window = max(2 * self.cfg.quiet_period_sec, 7200)
+            recent_modified = zbx.get_recently_modified_templates(
+                since=now - window
+            )
+            log.info(
+                "Audit log: шаблонов с правками за последние %s — %d",
+                format_duration(window),
+                len(recent_modified),
+            )
 
             # 4. Итерация по шаблонам, сбор действий
             actions: list[dict[str, Any]] = []
-            for tpl in templates:
+            total = len(templates)
+            for idx, tpl in enumerate(templates, 1):
+                # Прогресс-лог, чтобы было видно, что процесс жив.
+                if idx % 25 == 0 or idx == total:
+                    log.info(
+                        "  прогресс: %d/%d  (created=%d, updated=%d, deferred=%d, unchanged=%d)",
+                        idx, total,
+                        sum(1 for a in actions if a["_kind"] == "created"),
+                        sum(1 for a in actions if a["_kind"] == "updated"),
+                        len(stats.deferred),
+                        len(stats.unchanged),
+                    )
+
                 tplid = tpl["templateid"]
                 host = tpl["host"]
                 visible_name = tpl.get("name") or host
                 file_name = f"{safe_filename(host)}.yaml"
-                file_path = f"{self.cfg.templates_subdir}/{file_name}"
+                file_path = (
+                    f"{self.cfg.templates_subdir}/{file_name}"
+                    if self.cfg.templates_subdir else file_name
+                )
+
+                # 4.0 SHORT-CIRCUIT: если файл уже есть в GitLab И шаблон
+                #     недавно правился (клок в окне quiet_period) — откладываем
+                #     БЕЗ дорогого configuration.export. Экономит десятки
+                #     секунд на каждый активно-редактируемый шаблон.
+                last_modified = recent_modified.get(tplid)
+                if (
+                    file_path in existing_files
+                    and last_modified is not None
+                ):
+                    age = now - last_modified
+                    if age < self.cfg.quiet_period_sec:
+                        remaining = self.cfg.quiet_period_sec - age
+                        log.info(
+                            "[DEFER]  %s — правка %s назад, ждём ещё %s",
+                            visible_name,
+                            format_duration(age),
+                            format_duration(remaining),
+                        )
+                        stats.deferred.append((host, remaining))
+                        continue
 
                 try:
                     # 4.1 Экспорт в YAML (UTF-8)
@@ -171,19 +216,14 @@ class TemplateSynchronizer:
                     continue
 
                 # Сценарий 2: контент отличается — проверяем правило 1 часа
-                last_modified = bulk_audit.get(tplid)
                 if last_modified is None:
-                    # Fallback: одиночный запрос
-                    last_modified = zbx.get_template_last_modified(tplid)
-
-                if last_modified is None:
-                    # Нет данных аудита → коммитим (раз шаблон отличается, изменение есть;
-                    # без timestamp точное правило неприменимо).
-                    # При желании можно сделать наоборот — пропускать. Идём по варианту
-                    # «нет данных = считаем стабильным», то есть коммитим.
+                    # Записей в audit log нет (или старше окна) — шаблон считается
+                    # стабильным, коммитим расхождение. Это срабатывает например,
+                    # если правка была сделана импортом из API без записи в аудит,
+                    # или если housekeeper уже вычистил старую запись.
                     log.info(
-                        "[UPDATE] %s → %s (audit log не дал данных — "
-                        "коммитим, считая шаблон стабильным)",
+                        "[UPDATE] %s → %s (в audit log нет недавних правок — "
+                        "считаем стабильным)",
                         visible_name, file_path,
                     )
                     actions.append({
@@ -209,6 +249,10 @@ class TemplateSynchronizer:
                         "_kind": "updated",
                     })
                 else:
+                    # На самом деле сюда уже не попадёт благодаря short-circuit
+                    # выше — оставляю для случая «файла нет, но в audit недавно».
+                    # Если шаблон НОВЫЙ — мы должны его создать сразу (п.2 ТЗ),
+                    # даже если он только что отредактирован.
                     remaining = self.cfg.quiet_period_sec - age
                     log.info(
                         "[DEFER]  %s — изменён %s назад, ждём ещё %s",

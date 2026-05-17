@@ -88,13 +88,84 @@ class GitLabClient:
             if e.code == 404 and ok_404:
                 return None
             err_body = e.read().decode("utf-8", errors="replace")
+
+            # Диагностика частых случаев — даём пользователю понятную подсказку
+            hint = ""
+            if e.code == 404 and "Project Not Found" in err_body:
+                hint = (
+                    f"\n  → проект '{urllib.parse.unquote(self.project_id)}' не найден.\n"
+                    f"     Проверьте параметр gitlab.project_id в config.yaml:\n"
+                    f"       • для пути   используйте 'group/subgroup/project' "
+                    f"(точно как в URL после {self.base_url}/);\n"
+                    f"       • для ID     используйте числовой ID из "
+                    f"Project → Settings → General → «Project ID».\n"
+                    f"     Также убедитесь, что токен имеет доступ именно к этому проекту."
+                )
+            elif e.code == 401:
+                hint = (
+                    "\n  → 401 Unauthorized: токен GitLab невалиден или просрочен."
+                )
+            elif e.code == 403:
+                hint = (
+                    "\n  → 403 Forbidden: токену не хватает прав. "
+                    "Нужны scope 'api' + 'write_repository'."
+                )
+
             raise GitLabAPIError(
-                f"GitLab API {method} {path} → {e.code}: {err_body}"
+                f"GitLab API {method} {path} → {e.code}: {err_body}{hint}"
             ) from e
         except urllib.error.URLError as e:
             raise GitLabAPIError(
                 f"Ошибка подключения к GitLab: {e.reason}"
             ) from e
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Pre-flight: проверка доступа к проекту
+    # ──────────────────────────────────────────────────────────────────────────
+    def verify_access(self) -> dict[str, Any]:
+        """
+        Проверяет, что проект существует и токен имеет к нему доступ.
+        Возвращает информацию о проекте (path_with_namespace, default_branch, id).
+        Бросает GitLabAPIError с понятным сообщением при любых проблемах.
+
+        Дёшево (один GET) — стоит вызывать в начале синхронизации, чтобы
+        не падать после получения 400 шаблонов из Zabbix.
+        """
+        info = self._request("GET", f"/projects/{self.project_id}")
+        log.info(
+            "GitLab проект OK: %s (id=%s, default_branch=%s)",
+            info.get("path_with_namespace"),
+            info.get("id"),
+            info.get("default_branch"),
+        )
+
+        # Пустой репозиторий: ни одного коммита ещё не было. Ветки фактически нет,
+        # хотя в метаданных проекта default_branch уже может быть прописан.
+        # Первый коммит создаст её сам — пропускаем проверку.
+        if info.get("empty_repo"):
+            log.warning(
+                "Репозиторий пустой. Ветка '%s' будет создана первым коммитом.",
+                self.branch,
+            )
+            return info
+
+        # Репозиторий не пустой — проверяем, что указанная ветка реально существует.
+        try:
+            self._request(
+                "GET",
+                f"/projects/{self.project_id}/repository/branches/"
+                f"{urllib.parse.quote(self.branch, safe='')}",
+            )
+        except GitLabAPIError as e:
+            if "404" in str(e):
+                raise GitLabAPIError(
+                    f"Ветка '{self.branch}' не найдена в проекте "
+                    f"'{info.get('path_with_namespace')}'. "
+                    f"Default branch: '{info.get('default_branch')}'. "
+                    f"Поправьте gitlab.branch в config.yaml."
+                ) from e
+            raise
+        return info
 
     # ──────────────────────────────────────────────────────────────────────────
     # Repository tree / file get
@@ -103,6 +174,9 @@ class GitLabClient:
         """
         Возвращает список путей файлов (рекурсивно) в указанной поддиректории.
         Используется пагинация — GitLab отдаёт максимум 100 элементов на страницу.
+
+        На пустом репозитории (нет коммитов) GitLab отвечает 404 на /tree —
+        корректно интерпретируем это как «файлов пока нет».
         """
         results: list[str] = []
         page = 1
@@ -116,7 +190,8 @@ class GitLabClient:
             if sub_path:
                 params["path"] = sub_path
             items = self._request(
-                "GET", f"/projects/{self.project_id}/repository/tree", params=params
+                "GET", f"/projects/{self.project_id}/repository/tree",
+                params=params, ok_404=True,
             ) or []
             if not items:
                 break

@@ -19,7 +19,7 @@ import logging
 import ssl
 import urllib.error
 import urllib.request
-from typing import Any, Iterable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -208,9 +208,13 @@ class ZabbixAPI:
             records = self._call(
                 "auditlog.get",
                 {
-                    "output": ["clock", "action", "resourcetype", "resourceid"],
-                    "resourcetypes": [AUDIT_RESOURCE_TEMPLATE],
-                    "resourceids": [templateid],
+                    "output": ["clock"],
+                    # В Zabbix 7 фильтрация по типу/id ресурса идёт через filter,
+                    # а не top-level resourcetypes/resourceids (которых нет).
+                    "filter": {
+                        "resourcetype": AUDIT_RESOURCE_TEMPLATE,
+                        "resourceid": templateid,
+                    },
                     "sortfield": "clock",
                     "sortorder": "DESC",
                     "limit": 1,
@@ -233,37 +237,40 @@ class ZabbixAPI:
         except (KeyError, TypeError, ValueError):
             return None
 
-    def get_templates_last_modified_bulk(
-        self, templateids: Iterable[str]
-    ) -> dict[str, int]:
+    def get_recently_modified_templates(self, since: int) -> dict[str, int]:
         """
-        Версия для пакетного запроса — возвращает {templateid: clock} только
-        для тех шаблонов, у которых нашлись записи аудита.
-        Один запрос вместо N — кратно быстрее на больших инсталляциях.
-        """
-        ids = list(templateids)
-        if not ids:
-            return {}
+        Возвращает {templateid: latest_clock} — словарь шаблонов, у которых
+        ЕСТЬ записи в audit log с clock >= since (unix timestamp).
 
+        Один лёгкий запрос вместо запросов по каждому шаблону:
+        фильтр по resourcetype=TEMPLATE и time_from. Записей за окно
+        в пару часов обычно единицы-десятки, нагрузки практически нет.
+
+        Шаблоны, отсутствующие в результате, либо не правились в указанном
+        окне, либо были изменены настолько давно, что записи уже вычищены
+        housekeeper'ом — в обоих случаях нам они «стабильны».
+        """
         try:
             records = self._call(
                 "auditlog.get",
                 {
                     "output": ["clock", "resourceid"],
-                    "resourcetypes": [AUDIT_RESOURCE_TEMPLATE],
-                    "resourceids": ids,
+                    "filter": {"resourcetype": AUDIT_RESOURCE_TEMPLATE},
+                    "time_from": int(since),
                     "sortfield": "clock",
                     "sortorder": "DESC",
-                    # без limit — нам нужны все записи, чтобы найти максимум по каждому id
+                    "limit": 50000,  # с большим запасом; обычно записей сильно меньше
                 },
             )
         except ZabbixAPIError as e:
-            log.warning("auditlog.get (bulk) недоступен: %s", e)
+            log.warning("auditlog.get (bulk): %s", e)
             return {}
 
         latest: dict[str, int] = {}
         for rec in records:
             rid = str(rec.get("resourceid", ""))
+            if not rid:
+                continue
             try:
                 clock = int(rec["clock"])
             except (KeyError, TypeError, ValueError):
