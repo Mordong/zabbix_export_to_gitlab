@@ -2,6 +2,40 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.0.9 — диагностика сетевых ошибок (SSL, DNS, refused, timeout)
+
+### Улучшения
+
+- **Понятные сообщения при сбоях SSL/сети.** При получении
+  `URLError`/`SSLCertVerificationError` от Zabbix или GitLab вместо
+  криптического stacktrace пользователь получает подсказку с двумя
+  готовыми вариантами решения:
+
+  ```
+  → SSL-сертификат сервера https://zabbix.example.com не проходит проверку
+    (нет в trust store Python). Это обычно self-signed сертификат или
+    сертификат, подписанный внутренним корпоративным CA.
+
+    ВАРИАНТЫ РЕШЕНИЯ:
+    1) Быстрое: добавьте в Extra Connection-а флаг "verify_ssl": false
+       Команда:
+       airflow connections delete <conn_id>
+       airflow connections add <conn_id> \
+         --conn-type http --conn-host '...' \
+         --conn-login '...' --conn-password '...' \
+         --conn-extra '{"verify_ssl": false}'
+
+    2) Правильное: установите корневой CA сертификат в trust store
+       контейнера Airflow:
+         cp corporate-ca.crt /usr/local/share/ca-certificates/
+         update-ca-certificates
+       либо через env-переменные REQUESTS_CA_BUNDLE / SSL_CERT_FILE.
+  ```
+
+  Также распознаются и подсвечиваются: DNS-сбои («Name or service not known»),
+  отказ соединения («Connection refused»), таймауты — для каждого случая
+  даётся короткая подсказка, что проверить.
+
 ## v1.0.8 — полный аудит на совместимость с Airflow 3.1.2
 
 Систематическая ревизия DAG-файла по чек-листу breaking changes

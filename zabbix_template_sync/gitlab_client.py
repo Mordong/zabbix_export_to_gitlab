@@ -115,8 +115,17 @@ class GitLabClient:
                 f"GitLab API {method} {path} → {e.code}: {err_body}{hint}"
             ) from e
         except urllib.error.URLError as e:
+            reason_str = str(e.reason)
+            hint = ""
+            if "CERTIFICATE_VERIFY_FAILED" in reason_str or "unable to get local issuer" in reason_str:
+                hint = (
+                    f"\n→ SSL-сертификат GitLab не проходит проверку. "
+                    f"Если используется внутренний CA — либо добавьте "
+                    f"\"verify_ssl\": false в Extra GitLab Connection-а (быстро), "
+                    f"либо установите CA в trust store контейнера (правильно)."
+                )
             raise GitLabAPIError(
-                f"Ошибка подключения к GitLab: {e.reason}"
+                f"Ошибка подключения к GitLab: {e.reason}{hint}"
             ) from e
 
     # ──────────────────────────────────────────────────────────────────────────

@@ -233,7 +233,11 @@ ENVIRONMENTS = {
 | `Dag not found during start up` | DB-обращение на топ-уровне DAG (в Airflow 3) | Берите свежую версию DAG'а — все Variable/Connection вызовы должны быть внутри `_build_config()` |
 | `Airflow Variable 'test_gitlab_project_id' не задана` | Не создана обязательная Variable | Создайте её для нужной среды (см. шаг 3) |
 | `Connection 'zabbix_test' не найден` | Не создан Connection | См. шаг 2 для нужной среды |
+| `[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate` | Сертификат Zabbix/GitLab подписан внутренним CA, которого нет в trust store контейнера | Быстро: в Extra Connection-а поставьте `{"verify_ssl": false}`. Правильно: положите CA в `/usr/local/share/ca-certificates/` контейнера и запустите `update-ca-certificates`. |
+| `Name or service not known` / DNS-ошибки | Из контейнера Airflow не резолвится hostname | Проверьте DNS и `/etc/resolv.conf`, корпоративные DNS-серверы должны быть доступны воркеру |
+| `Connection refused` | Порт закрыт или сервис не запущен | Проверьте firewall/NAT/маршруты между Airflow worker и Zabbix/GitLab |
 | `TypeError: ... 'schedule_interval'` | Старая версия DAG в Airflow 3 | Берите свежий `zabbix_templates_to_gitlab.py` |
+| `TypeError: Variable.get() got an unexpected keyword argument 'default_var'` | Старая версия DAG, не использует обёртку `_var_get` | Подмените DAG-файл свежей версией |
 | Deprecation warnings про `airflow.hooks.base.BaseHook` | Сработал legacy-fallback импорта | На Airflow 3 проверьте, что установлен `apache-airflow-providers-standard` |
 
 ## Структура репозитория-приёмника

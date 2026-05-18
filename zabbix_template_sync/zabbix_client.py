@@ -88,8 +88,56 @@ class ZabbixAPI:
                 # Zabbix всегда отвечает в UTF-8
                 response = json.loads(r.read().decode("utf-8"))
         except urllib.error.URLError as e:
-            log.error("Zabbix API connection error on %s: %s", method, e.reason)
-            raise ConnectionError(f"Ошибка подключения к Zabbix: {e.reason}") from e
+            reason = e.reason
+            log.error("Zabbix API connection error on %s: %s", method, reason)
+
+            # Диагностика частых случаев — даём пользователю подсказку,
+            # вместо криптического stacktrace.
+            hint = ""
+            reason_str = str(reason)
+            if "CERTIFICATE_VERIFY_FAILED" in reason_str or "unable to get local issuer" in reason_str:
+                hint = (
+                    f"\n\n→ SSL-сертификат сервера {self.url.split('/api_jsonrpc.php')[0]} "
+                    f"не проходит проверку (нет в trust store Python).\n"
+                    f"  Это обычно self-signed сертификат или сертификат, "
+                    f"подписанный внутренним корпоративным CA.\n"
+                    f"\n"
+                    f"  ВАРИАНТЫ РЕШЕНИЯ:\n"
+                    f"  1) Быстрое: добавьте в Extra Connection-а флаг "
+                    f"\"verify_ssl\": false\n"
+                    f"     Команда:\n"
+                    f"     airflow connections delete <conn_id>\n"
+                    f"     airflow connections add <conn_id> \\\n"
+                    f"       --conn-type http --conn-host '{self.url.split('/api_jsonrpc.php')[0]}' \\\n"
+                    f"       --conn-login '...' --conn-password '...' \\\n"
+                    f"       --conn-extra '{{\"verify_ssl\": false}}'\n"
+                    f"\n"
+                    f"  2) Правильное: установите корневой CA сертификат "
+                    f"в trust store контейнера Airflow:\n"
+                    f"     cp corporate-ca.crt /usr/local/share/ca-certificates/\n"
+                    f"     update-ca-certificates\n"
+                    f"     либо через env-переменные REQUESTS_CA_BUNDLE / SSL_CERT_FILE."
+                )
+            elif "Name or service not known" in reason_str or "nodename nor servname" in reason_str:
+                hint = (
+                    f"\n→ Не удалось разрешить DNS-имя хоста. "
+                    f"Проверьте URL в Connection и доступность DNS из Airflow worker."
+                )
+            elif "Connection refused" in reason_str:
+                hint = (
+                    f"\n→ Сервер Zabbix недоступен по этому адресу/порту. "
+                    f"Проверьте, что HTTPS-порт открыт и сервер запущен."
+                )
+            elif "timed out" in reason_str.lower():
+                hint = (
+                    f"\n→ Таймаут подключения. "
+                    f"Проверьте сетевую доступность Zabbix из Airflow worker "
+                    f"(firewall, прокси, маршруты)."
+                )
+
+            raise ConnectionError(
+                f"Ошибка подключения к Zabbix: {reason}{hint}"
+            ) from e
 
         if "error" in response:
             err = response["error"]
