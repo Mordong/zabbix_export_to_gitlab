@@ -2,6 +2,89 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.0.6 — поддержка нескольких окружений (TEST + PROD)
+
+### Изменения
+
+- **DAG-фабрика для multi-env синхронизации.** Из одного DAG-файла
+  регистрируются несколько независимых DAG'ов — по одному на каждую среду
+  из словаря `ENVIRONMENTS` в начале файла. По умолчанию это `test` и
+  `prod`. Добавить новую среду — одна запись в словаре + создать
+  соответствующие Connections/Variables.
+
+  Каждый DAG имеет собственные:
+  - `dag_id`: `zabbix_templates_to_gitlab_test`, `zabbix_templates_to_gitlab_prod`;
+  - расписание (TEST `*/5`, PROD `*/15` — настраивается в `ENVIRONMENTS`);
+  - `default_quiet_period_sec` (TEST 5 мин, PROD 1 час — по ТЗ);
+  - получателей email-алертов и owner'а;
+  - тег в UI (`test`/`prod`) для фильтрации.
+
+- **Изоляция секретов по средам.** Connections — `zabbix_<env>` и
+  `gitlab_<env>`. Variables — с префиксом среды:
+  `test_gitlab_project_id`, `prod_gitlab_project_id` и т.д.
+  Один токен/пароль никогда не shared между TEST и PROD.
+
+- **Раздел README про архитектурный выбор.** Объяснение, почему для
+  multi-env используются Airflow Connections/Variables, а не
+  `config.yaml`: безопасность (Fernet-шифрование секретов), ротация без
+  передеплоя, совместимость с архитектурой Airflow 3 (нет top-level
+  DB-чтений), интеграция с внешними secrets backends.
+
+## v1.0.5 — полная совместимость с Airflow 3.x
+
+### Исправления
+
+- **Убраны top-level DB-обращения из DAG.**
+  В Airflow 3 архитектура изменилась: DAG processor работает изолированно
+  от метабазы. Любой вызов `Variable.get()` или `BaseHook.get_connection()`
+  на ТОП-УРОВНЕ DAG-файла ломает регистрацию DAG'а с ошибкой
+  `Dag not found during start up`. Все DB-обращения вынесены строго
+  в тело таска `_build_config()`. Расписание `schedule="*/15 * * * *"`
+  захардкожено в коде (раньше шло из Variable — это и было причиной
+  ошибки регистрации).
+
+- **Импорты через `airflow.sdk` для Airflow 3.x.**
+  Официальный публичный API авторов DAG в Airflow 3 — пакет `airflow.sdk`.
+  Старые пути (`from airflow import DAG`, `from airflow.hooks.base import
+  BaseHook`, `from airflow.models import Variable`) ещё работают через
+  deprecation shims, но генерируют warnings. DAG переведён на
+  условные импорты: сначала пробуется `airflow.sdk`, fallback — legacy
+  для Airflow 2.x. Поддерживаются обе ветки одним файлом.
+
+- **Понятные сообщения если Variables/Connections не созданы.**
+  Если `gitlab_project_id` Variable отсутствует или Connection не настроен,
+  таск падает с конкретной инструкцией: какую команду запустить
+  (`airflow variables set ...` / `airflow connections add ...`), чтобы
+  это исправить. Раньше получался необработанный traceback.
+
+### Документация
+
+- В README добавлен подробный раздел про настройку Airflow 3:
+  - команды `airflow connections add` / `airflow variables set` для CLI;
+  - таблица всех Variables с пометкой «обязательная / опциональная»;
+  - таблица диагностики типичных проблем с решениями.
+- Пояснение почему `schedule` нельзя сделать настраиваемым через Variable
+  в Airflow 3.
+
+## v1.0.4 — совместимость с Airflow 3.x
+
+### Исправления
+
+- **`schedule_interval` → `schedule` в DAG.**
+  В Airflow 3.0+ параметр `schedule_interval` полностью удалён (был
+  deprecated с 2.4). Без этого фикса DAG не парсится в Airflow 3 с ошибкой
+  `TypeError: DAG.__init__() got an unexpected keyword argument 'schedule_interval'`.
+  Параметр `schedule` работает идентично и поддерживается всеми версиями
+  Airflow 2.4+, так что DAG теперь совместим с 2.4-2.x и 3.x одновременно.
+
+- **`PythonOperator` через provider-пакет.**
+  В Airflow 3.0+ `PythonOperator` переехал из `airflow.operators.python`
+  в `airflow.providers.standard.operators.python` (provider
+  `apache-airflow-providers-standard`, ставится по умолчанию). Старый путь
+  ещё работает в 3.0 с deprecation warning, но может быть удалён.
+  В DAG добавлен try/except — сначала пробуем новый путь, fallback на
+  старый для Airflow 2.x.
+
 ## v1.0.3 — production-ready
 
 ### Исправления

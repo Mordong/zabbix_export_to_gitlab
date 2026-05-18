@@ -1,34 +1,72 @@
 """
-Airflow DAG: синхронизация шаблонов Zabbix 7 в GitLab.
+Airflow DAG-фабрика: синхронизация шаблонов Zabbix 7 в GitLab
+для нескольких окружений (TEST и PROD).
 
-Расписание:
-    Каждые 15 минут — это компромисс между «реакция в течение часа после
-    последнего изменения» и нагрузкой на API. Можно настроить через
-    Airflow Variable `zabbix_sync_schedule`.
+Из одного DAG-файла регистрируется N независимых DAG'ов — по одному
+на каждую среду из ENVIRONMENTS ниже. Это даёт:
+  - разные расписания (TEST чаще, PROD реже);
+  - разные параметры (например quiet_period: 5 мин в TEST, 1 час в PROD);
+  - разные retry/email-политики;
+  - возможность отключить один DAG, не трогая другой.
 
-Конфигурация — через Airflow Connections и Variables:
-  Connection «zabbix_default»:
-      host:     https://zabbix.example.com
-      login:    api-readonly
-      password: <pwd>
-      extra:    {"verify_ssl": true}
+──────────────────────────────────────────────────────────────────────────────
+АРХИТЕКТУРНЫЙ ВЫБОР: Variables vs config.yaml
+──────────────────────────────────────────────────────────────────────────────
+Все секреты и настройки берутся из Airflow Connections и Variables, НЕ из
+config.yaml. Это сделано по двум причинам:
 
-  Connection «gitlab_default»:
-      host:     https://gitlab.example.com
-      password: <PRIVATE-TOKEN>     ← поле password используется как токен
-      extra:    {"verify_ssl": true}
+1. Безопасность. Пароли и токены, лежащие в Connections, шифруются Fernet'ом
+   в метабазе Airflow. В config.yaml они лежали бы в открытом виде в git.
+   Также легко подключить внешний secrets backend (Vault, AWS SM, GCP SM)
+   без правок кода.
 
-  Variables (опционально):
-      gitlab_project_id          — числовой ID или "group/project"   (обязательно)
-      gitlab_branch              — ветка                              (default: main)
-      zabbix_sync_subdir         — поддиректория для шаблонов        (default: templates)
-      zabbix_sync_quiet_period   — период «тишины» в секундах         (default: 3600)
-      zabbix_sync_template_groups— JSON-массив групп шаблонов        (default: [] = все)
-      zabbix_sync_single_commit  — "true"/"false"                     (default: true)
+2. Соответствие архитектуре Airflow 3. DAG processor работает изолированно
+   от метабазы — никаких top-level DB-обращений. Все Variable.get() сидят
+   внутри _build_config(), который вызывается только из таска.
 
-Зависимости (на Airflow worker):
-      pip install pyyaml
-      # Никаких python-gitlab/pyzabbix не требуется — клиенты на urllib.
+config.yaml оставлен для CLI-режима (zabbix_template_sync.cli) — ручные
+прогоны и отладка вне Airflow.
+
+──────────────────────────────────────────────────────────────────────────────
+ТРЕБУЕМЫЕ Connections для каждой среды
+──────────────────────────────────────────────────────────────────────────────
+  zabbix_<env>   — host, login, password, extra={"verify_ssl": true/false}
+  gitlab_<env>   — host, password (= PRIVATE-TOKEN), extra={"verify_ssl": ...}
+
+Создание через CLI:
+  airflow connections add zabbix_test \
+    --conn-type http --conn-host https://zabbix-test.example.com \
+    --conn-login api-readonly --conn-password '...' \
+    --conn-extra '{"verify_ssl": true}'
+
+  airflow connections add gitlab_test \
+    --conn-type http --conn-host https://gitlab.example.com \
+    --conn-password 'glpat-...' \
+    --conn-extra '{"verify_ssl": true}'
+
+(Аналогично для prod: zabbix_prod, gitlab_prod.)
+
+──────────────────────────────────────────────────────────────────────────────
+ТРЕБУЕМЫЕ Variables (префиксованы средой)
+──────────────────────────────────────────────────────────────────────────────
+  <env>_gitlab_project_id            — обязательная
+  <env>_gitlab_branch                — опц. (default: "main")
+  <env>_zabbix_sync_subdir           — опц. (default: "templates")
+  <env>_zabbix_sync_quiet_period     — опц. (default: см. ENVIRONMENTS ниже)
+  <env>_zabbix_sync_template_groups  — опц. (default: "[]" = все группы)
+  <env>_zabbix_sync_single_commit    — опц. (default: "true")
+
+Пример:
+  airflow variables set test_gitlab_project_id "observability/zabbix-cis/templates/test"
+  airflow variables set prod_gitlab_project_id "observability/zabbix-cis/templates/prod"
+
+──────────────────────────────────────────────────────────────────────────────
+Как добавить новую среду (например, STAGING)
+──────────────────────────────────────────────────────────────────────────────
+1. Добавить запись в ENVIRONMENTS ниже.
+2. Создать Connections zabbix_staging / gitlab_staging.
+3. Создать Variable staging_gitlab_project_id.
+4. После следующего парсинга DAG появится сам.
 """
 
 from __future__ import annotations
@@ -37,10 +75,19 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.hooks.base import BaseHook
-from airflow.models import Variable
+# ── Совместимость импортов между Airflow 2.x и 3.x ────────────────────────────
+try:
+    from airflow.sdk import DAG, Variable
+    from airflow.sdk.bases.hook import BaseHook
+except ImportError:
+    from airflow import DAG  # type: ignore[no-redef]
+    from airflow.models import Variable  # type: ignore[no-redef]
+    from airflow.hooks.base import BaseHook  # type: ignore[no-redef]
+
+try:
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:
+    from airflow.operators.python import PythonOperator  # type: ignore[no-redef]
 
 from zabbix_template_sync import SyncConfig, TemplateSynchronizer
 
@@ -48,23 +95,88 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Загрузка конфига из Airflow
+# Конфигурация окружений
 # ──────────────────────────────────────────────────────────────────────────────
-def _build_config() -> SyncConfig:
-    zbx_conn = BaseHook.get_connection("zabbix_default")
-    gl_conn = BaseHook.get_connection("gitlab_default")
+# Меняйте только эту секцию, чтобы добавить/удалить среду или подстроить
+# поведение под конкретное окружение.
+ENVIRONMENTS = {
+    "test": {
+        # Cron-расписание. В TEST можно чаще — для быстрого фидбека на правки.
+        "schedule": "*/5 * * * *",
+        # Default quiet_period, если соответствующая Variable не задана.
+        # В TEST разумно 5 мин — изменения должны быстро докатываться.
+        "default_quiet_period_sec": 300,
+        # Кто получает алерты при сбоях этого DAG'а.
+        "owner": "monitoring-team",
+        "email": [],  # ["[email protected]"]
+        # Тег в Airflow UI для фильтрации.
+        "env_tag": "test",
+    },
+    "prod": {
+        # PROD — каждые 15 минут.
+        "schedule": "*/15 * * * *",
+        # PROD — строго 1 час «тишины» по ТЗ.
+        "default_quiet_period_sec": 3600,
+        "owner": "monitoring-team",
+        "email": [],  # ["[email protected]"]
+        "env_tag": "prod",
+    },
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Загрузка конфига из Airflow для конкретной среды.
+# Вызывается ИЗ ТАСКА, не на парсинге DAG.
+# ──────────────────────────────────────────────────────────────────────────────
+def _build_config(env: str, env_defaults: dict) -> SyncConfig:
+    zbx_conn_id = f"zabbix_{env}"
+    gl_conn_id = f"gitlab_{env}"
+
+    try:
+        zbx_conn = BaseHook.get_connection(zbx_conn_id)
+    except Exception as e:
+        raise RuntimeError(
+            f"Connection '{zbx_conn_id}' не найден. Создайте его:\n"
+            f"  airflow connections add {zbx_conn_id} \\\n"
+            f"    --conn-type http --conn-host https://zabbix-{env}.example.com \\\n"
+            f"    --conn-login <user> --conn-password '<pwd>' \\\n"
+            f"    --conn-extra '{{\"verify_ssl\": true}}'"
+        ) from e
+
+    try:
+        gl_conn = BaseHook.get_connection(gl_conn_id)
+    except Exception as e:
+        raise RuntimeError(
+            f"Connection '{gl_conn_id}' не найден. Создайте его:\n"
+            f"  airflow connections add {gl_conn_id} \\\n"
+            f"    --conn-type http --conn-host https://gitlab.example.com \\\n"
+            f"    --conn-password '<PRIVATE-TOKEN>' \\\n"
+            f"    --conn-extra '{{\"verify_ssl\": true}}'"
+        ) from e
 
     zbx_extra = zbx_conn.extra_dejson or {}
     gl_extra = gl_conn.extra_dejson or {}
 
+    project_id = Variable.get(f"{env}_gitlab_project_id", default_var=None)
+    if not project_id:
+        raise RuntimeError(
+            f"Airflow Variable '{env}_gitlab_project_id' не задана. Создайте:\n"
+            f"  airflow variables set {env}_gitlab_project_id "
+            f"'group/subgroup/project'"
+        )
+
     template_groups_raw = Variable.get(
-        "zabbix_sync_template_groups", default_var="[]"
+        f"{env}_zabbix_sync_template_groups", default_var="[]"
     )
     try:
         template_groups = json.loads(template_groups_raw) or None
     except json.JSONDecodeError:
-        log.warning("zabbix_sync_template_groups не валидный JSON, игнорирую")
+        log.warning(
+            "%s_zabbix_sync_template_groups не валидный JSON, игнорирую", env
+        )
         template_groups = None
+
+    default_quiet = env_defaults["default_quiet_period_sec"]
 
     return SyncConfig(
         # Zabbix
@@ -75,61 +187,71 @@ def _build_config() -> SyncConfig:
 
         # GitLab
         gitlab_url=gl_conn.host,
-        gitlab_project_id=Variable.get("gitlab_project_id"),
+        gitlab_project_id=project_id,
         gitlab_token=gl_conn.password,
-        gitlab_branch=Variable.get("gitlab_branch", default_var="main"),
+        gitlab_branch=Variable.get(
+            f"{env}_gitlab_branch", default_var="main"
+        ),
         gitlab_verify_ssl=bool(gl_extra.get("verify_ssl", True)),
 
         # Логика
         templates_subdir=Variable.get(
-            "zabbix_sync_subdir", default_var="templates"
+            f"{env}_zabbix_sync_subdir", default_var="templates"
         ),
         quiet_period_sec=int(
-            Variable.get("zabbix_sync_quiet_period", default_var="3600")
+            Variable.get(
+                f"{env}_zabbix_sync_quiet_period",
+                default_var=str(default_quiet),
+            )
         ),
         template_groups=template_groups,
         single_commit=Variable.get(
-            "zabbix_sync_single_commit", default_var="true"
+            f"{env}_zabbix_sync_single_commit", default_var="true"
         ).lower() == "true",
+
+        commit_author_name=f"Zabbix Sync Bot ({env})",
+        commit_author_email=f"zabbix-sync-{env}@example.com",
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Основной таск
+# Таск (общий для всех сред, среда передаётся через op_kwargs)
 # ──────────────────────────────────────────────────────────────────────────────
-def sync_templates_task(**context) -> dict:
-    cfg = _build_config()
+def sync_templates_task(env: str, env_defaults: dict, **context) -> dict:
+    cfg = _build_config(env, env_defaults)
     log.info(
-        "Старт синхронизации Zabbix→GitLab. "
-        "URL Zabbix=%s, GitLab=%s, project=%s, branch=%s, quiet_period=%ds",
-        cfg.zabbix_url, cfg.gitlab_url, cfg.gitlab_project_id,
+        "[%s] Старт синхронизации Zabbix→GitLab. "
+        "Zabbix=%s, GitLab=%s, project=%s, branch=%s, quiet_period=%ds",
+        env.upper(), cfg.zabbix_url, cfg.gitlab_url, cfg.gitlab_project_id,
         cfg.gitlab_branch, cfg.quiet_period_sec,
     )
 
     syncer = TemplateSynchronizer(cfg)
     stats = syncer.run()
 
-    log.info("Итоги: %s", stats.summary())
+    log.info("[%s] Итоги: %s", env.upper(), stats.summary())
     if stats.created:
-        log.info("Созданы: %s", ", ".join(stats.created))
+        log.info("[%s] Созданы: %s", env.upper(), ", ".join(stats.created))
     if stats.updated:
-        log.info("Обновлены: %s", ", ".join(stats.updated))
+        log.info("[%s] Обновлены: %s", env.upper(), ", ".join(stats.updated))
     if stats.deferred:
         log.info(
-            "Отложены (правило 1 часа): %s",
+            "[%s] Отложены (правило 1 часа): %s",
+            env.upper(),
             ", ".join(f"{h} (через {s}с)" for h, s in stats.deferred),
         )
     if stats.errors:
         log.error(
-            "Ошибки по шаблонам:\n%s",
+            "[%s] Ошибки по шаблонам:\n%s",
+            env.upper(),
             "\n".join(f"  {h}: {e}" for h, e in stats.errors),
         )
-        # Падаем, чтобы Airflow зафиксировал failure и сработали алерты
         raise RuntimeError(
-            f"Синхронизация завершилась с {len(stats.errors)} ошибками"
+            f"[{env}] Синхронизация завершилась с {len(stats.errors)} ошибками"
         )
 
     return {
+        "env": env,
         "created": stats.created,
         "updated": stats.updated,
         "deferred": [(h, s) for h, s in stats.deferred],
@@ -138,33 +260,44 @@ def sync_templates_task(**context) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DAG
+# Фабрика DAG'ов
+#
+# КРИТИЧНО: создаваемые DAG-объекты должны быть положены в globals(), иначе
+# Airflow их не зарегистрирует. Цикл `for env, env_cfg in ENVIRONMENTS.items()`
+# именно это и делает.
 # ──────────────────────────────────────────────────────────────────────────────
-default_args = {
-    "owner": "monitoring-team",
-    "depends_on_past": False,
-    "email_on_failure": True,
-    "email_on_retry": False,
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
-}
+def _make_dag(env: str, env_cfg: dict) -> DAG:
+    default_args = {
+        "owner": env_cfg["owner"],
+        "depends_on_past": False,
+        "email": env_cfg.get("email", []),
+        "email_on_failure": bool(env_cfg.get("email")),
+        "email_on_retry": False,
+        "retries": 2,
+        "retry_delay": timedelta(minutes=5),
+    }
 
-with DAG(
-    dag_id="zabbix_templates_to_gitlab",
-    description="Sync Zabbix 7 templates into GitLab as YAML",
-    default_args=default_args,
-    start_date=datetime(2025, 1, 1),
-    # Каждые 15 минут — изменения старше часа гарантированно попадут в коммит
-    # за следующие 15 минут после истечения «тихого периода».
-    schedule_interval=Variable.get(
-        "zabbix_sync_schedule", default_var="*/15 * * * *"
-    ),
-    catchup=False,
-    max_active_runs=1,
-    tags=["zabbix", "gitlab", "monitoring", "ci"],
-) as dag:
-
-    sync = PythonOperator(
-        task_id="sync_templates",
-        python_callable=sync_templates_task,
+    dag = DAG(
+        dag_id=f"zabbix_templates_to_gitlab_{env}",
+        description=f"Sync Zabbix 7 templates into GitLab as YAML ({env.upper()})",
+        default_args=default_args,
+        start_date=datetime(2025, 1, 1),
+        schedule=env_cfg["schedule"],
+        catchup=False,
+        max_active_runs=1,
+        tags=["zabbix", "gitlab", "monitoring", "ci", env_cfg["env_tag"]],
     )
+
+    with dag:
+        PythonOperator(
+            task_id="sync_templates",
+            python_callable=sync_templates_task,
+            op_kwargs={"env": env, "env_defaults": env_cfg},
+        )
+
+    return dag
+
+
+# Регистрируем по одному DAG-объекту в globals() на каждую среду
+for _env, _env_cfg in ENVIRONMENTS.items():
+    globals()[f"zabbix_templates_to_gitlab_{_env}"] = _make_dag(_env, _env_cfg)

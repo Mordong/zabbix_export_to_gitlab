@@ -94,50 +94,147 @@ python -m zabbix_template_sync.cli
 python -m zabbix_template_sync.cli --config config.yaml --force-all
 ```
 
-## Запуск через Airflow
+## Запуск через Airflow (несколько сред: TEST + PROD)
+
+Один DAG-файл регистрирует **несколько DAG'ов** — по одному на каждую среду
+из списка `ENVIRONMENTS` внутри `zabbix_templates_to_gitlab.py`. У каждой
+среды свои Connections, свои Variables (с префиксом среды) и своё расписание.
+
+Поддерживаются Airflow 2.4+ и Airflow 3.x.
+
+### Почему Variables, а не config.yaml
+
+Все настройки и секреты хранятся в Airflow Connections и Variables, а не в
+файле. Конкретно для среды TEST+PROD это даёт:
+
+- **Безопасность.** Пароли и токены в Connections шифруются Fernet'ом в
+  метабазе Airflow. В git-репозитории с config.yaml они лежали бы в открытом
+  виде. Также легко подключить внешний secrets backend (Vault, AWS SM, GCP SM)
+  без правок кода — Airflow умеет это из коробки.
+- **Ротация без передеплоя.** Меняете значение в UI — DAG подхватит на
+  следующем прогоне. С config.yaml потребуется git commit → deploy → reload.
+- **RBAC и аудит.** Airflow логирует кто и когда менял Connection/Variable.
+- **Без top-level чтения из DAG.** В Airflow 3 DAG processor работает
+  изолированно от метабазы — любое чтение `config.yaml` на парсинге DAG
+  сразу делает деплой хрупким.
+
+`config.yaml` оставлен для CLI-режима (`python -m zabbix_template_sync.cli`)
+— это удобно для разовых ручных прогонов и отладки вне Airflow.
 
 ### 1. Положите пакет туда, откуда Airflow его увидит
 
-Вариант A — установка как пакет:
-```bash
-pip install /path/to/zabbix-template-sync
-```
-
-Вариант B — синхронизировать в `dags/` через git-sync sidecar:
 ```
 $AIRFLOW_HOME/dags/
 ├── zabbix_templates_to_gitlab.py
 └── zabbix_template_sync/        # сам пакет, рядом с DAG
 ```
 
-### 2. Connections в Airflow UI
+или установите как пакет: `pip install /path/to/zabbix-template-sync`.
 
-**zabbix_default** (тип: HTTP):
-- Host: `https://zabbix.example.com`
-- Login: `api-readonly`
-- Password: `<пароль>`
-- Extra: `{"verify_ssl": true}`
+### 2. Создайте Connections — по одному набору на каждую среду
 
-**gitlab_default** (тип: HTTP):
-- Host: `https://gitlab.example.com`
-- Password: `<PRIVATE-TOKEN>` (поле password = токен)
-- Extra: `{"verify_ssl": true}`
+```bash
+# TEST
+airflow connections add zabbix_test \
+    --conn-type http \
+    --conn-host 'https://zabbix-test.example.com' \
+    --conn-login 'api-readonly' \
+    --conn-password 'ПАРОЛЬ_TEST' \
+    --conn-extra '{"verify_ssl": true}'
 
-### 3. Variables
+airflow connections add gitlab_test \
+    --conn-type http \
+    --conn-host 'https://gitlab.example.com' \
+    --conn-password 'glpat-TOKEN_TEST' \
+    --conn-extra '{"verify_ssl": true}'
 
-| Имя | Значение | Default |
+# PROD
+airflow connections add zabbix_prod \
+    --conn-type http \
+    --conn-host 'https://zabbix-prod.example.com' \
+    --conn-login 'api-readonly' \
+    --conn-password 'ПАРОЛЬ_PROD' \
+    --conn-extra '{"verify_ssl": true}'
+
+airflow connections add gitlab_prod \
+    --conn-type http \
+    --conn-host 'https://gitlab.example.com' \
+    --conn-password 'glpat-TOKEN_PROD' \
+    --conn-extra '{"verify_ssl": true}'
+```
+
+### 3. Создайте Variables — обязательные с префиксом среды
+
+```bash
+# TEST — обязательная
+airflow variables set test_gitlab_project_id "observability/zabbix-cis/templates/test"
+
+# PROD — обязательная
+airflow variables set prod_gitlab_project_id "observability/zabbix-cis/templates/prod"
+
+# Опциональные — можно не создавать, есть defaults в коде
+airflow variables set test_zabbix_sync_subdir ""           # в корень репо
+airflow variables set prod_zabbix_sync_subdir "templates"
+airflow variables set prod_zabbix_sync_template_groups '["Templates/OS","Шаблоны/СУБД"]'
+```
+
+#### Полная таблица Variables (на каждую среду свой префикс)
+
+| Имя | Обязательная | Default | Заметки |
+|---|---|---|---|
+| `<env>_gitlab_project_id` | да | — | путь или ID проекта GitLab |
+| `<env>_gitlab_branch` | нет | `main` | целевая ветка |
+| `<env>_zabbix_sync_subdir` | нет | `templates` | поддиректория; `""` = в корень |
+| `<env>_zabbix_sync_quiet_period` | нет | 300 (TEST) / 3600 (PROD) | секунд «тишины» перед коммитом |
+| `<env>_zabbix_sync_template_groups` | нет | `[]` | JSON-массив групп для фильтра |
+| `<env>_zabbix_sync_single_commit` | нет | `true` | объединять изменения в 1 коммит |
+
+### 4. Настройте расписание / параметры среды в коде DAG'а
+
+Откройте `zabbix_templates_to_gitlab.py` и подправьте `ENVIRONMENTS` под себя:
+
+```python
+ENVIRONMENTS = {
+    "test": {
+        "schedule": "*/5 * * * *",            # TEST — каждые 5 минут
+        "default_quiet_period_sec": 300,      # 5 минут «тишины»
+        "owner": "monitoring-team",
+        "email": ["[email protected]"],
+        "env_tag": "test",
+    },
+    "prod": {
+        "schedule": "*/15 * * * *",           # PROD — каждые 15 минут
+        "default_quiet_period_sec": 3600,     # 1 час «тишины» (по ТЗ)
+        "owner": "monitoring-team",
+        "email": ["[email protected]"],
+        "env_tag": "prod",
+    },
+}
+```
+
+### 5. Включите DAG'и
+
+В UI появятся два DAG'а: `zabbix_templates_to_gitlab_test` и
+`zabbix_templates_to_gitlab_prod`. Их можно включать/выключать независимо,
+фильтровать по тегам `test`/`prod`.
+
+### Чтобы добавить новую среду (например, STAGING)
+
+1. Добавить запись `"staging": {...}` в `ENVIRONMENTS` в DAG-файле.
+2. Создать Connections `zabbix_staging` и `gitlab_staging`.
+3. Создать Variable `staging_gitlab_project_id`.
+4. После следующего парсинга DAG `zabbix_templates_to_gitlab_staging`
+   появится сам — никаких других правок не нужно.
+
+### Диагностика проблем
+
+| Симптом | Причина | Решение |
 |---|---|---|
-| `gitlab_project_id` | `monitoring/zabbix-templates` | — (обязательно) |
-| `gitlab_branch` | `main` | `main` |
-| `zabbix_sync_subdir` | `templates` | `templates` |
-| `zabbix_sync_quiet_period` | `3600` | `3600` |
-| `zabbix_sync_template_groups` | `["Templates/OS","Шаблоны/СУБД"]` | `[]` (все) |
-| `zabbix_sync_single_commit` | `true` | `true` |
-| `zabbix_sync_schedule` | `*/15 * * * *` | `*/15 * * * *` |
-
-### 4. Включите DAG
-
-DAG `zabbix_templates_to_gitlab` появится в списке. По умолчанию запускается каждые 15 минут.
+| `Dag not found during start up` | DB-обращение на топ-уровне DAG (в Airflow 3) | Берите свежую версию DAG'а — все Variable/Connection вызовы должны быть внутри `_build_config()` |
+| `Airflow Variable 'test_gitlab_project_id' не задана` | Не создана обязательная Variable | Создайте её для нужной среды (см. шаг 3) |
+| `Connection 'zabbix_test' не найден` | Не создан Connection | См. шаг 2 для нужной среды |
+| `TypeError: ... 'schedule_interval'` | Старая версия DAG в Airflow 3 | Берите свежий `zabbix_templates_to_gitlab.py` |
+| Deprecation warnings про `airflow.hooks.base.BaseHook` | Сработал legacy-fallback импорта | На Airflow 3 проверьте, что установлен `apache-airflow-providers-standard` |
 
 ## Структура репозитория-приёмника
 
