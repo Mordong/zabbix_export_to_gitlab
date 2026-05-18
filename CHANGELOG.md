@@ -2,6 +2,79 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.0.8 — полный аудит на совместимость с Airflow 3.1.2
+
+Систематическая ревизия DAG-файла по чек-листу breaking changes
+и best practices Airflow 3.1+. Все 15 проверок пройдены, плюс одна
+улучшающая правка.
+
+### Улучшения
+
+- **`start_date` через pendulum с timezone.** Раньше использовался
+  `datetime(2025, 1, 1)` без таймзоны — это работало в Airflow 3,
+  но генерировало warnings и не соответствует рекомендации из
+  документации Airflow 3 «Time zone aware Dags». Теперь:
+  ```python
+  try:
+      import pendulum
+      _START_DATE = pendulum.datetime(2025, 1, 1, tz="UTC")
+  except ImportError:
+      _START_DATE = datetime(2025, 1, 1)   # fallback
+  ```
+  pendulum поставляется вместе с Airflow на любой современной
+  инсталляции — fallback на случай очень старых сред.
+
+### Подтверждённая совместимость (что проверено и работает)
+
+Каждый пункт проверен статическим анализом + симуляцией импорта в
+обоих режимах:
+
+| # | Проверка | Статус |
+|---|---|---|
+| 1 | Синтаксис Python валиден (AST) | ✓ |
+| 2 | Параметр DAG — `schedule=` (не `schedule_interval=`) | ✓ |
+| 3 | На топ-уровне DAG нет `Variable.get()` / `BaseHook.get_connection()` | ✓ |
+| 4 | Используется `airflow.sdk` namespace (рекомендация Airflow 3) | ✓ |
+| 5 | `PythonOperator` из `providers.standard` (требование Airflow 3) | ✓ |
+| 6 | `Variable.get()` обёрнут в `_var_get()` (обходит `default`/`default_var` несовместимость) | ✓ |
+| 7 | `start_date` timezone-aware через pendulum | ✓ |
+| 8 | `catchup=False` задан явно | ✓ |
+| 9 | Не используются удалённые context-переменные (`execution_date`, `prev_ds` и др.) | ✓ |
+| 10 | Нет `provide_context=True` (deprecated с Airflow 2.0) | ✓ |
+| 11 | Нет `SubDagOperator` (удалён в Airflow 3) | ✓ |
+| 12 | Нет прямого доступа к метабазе (`create_session`, `provide_session`, sqlalchemy) | ✓ |
+| 13 | Нет SLA параметров (`sla=`, `sla_miss_callback`) — удалены в Airflow 3 | ✓ |
+| 14 | Нет `from airflow.models import DAG` (deprecated) | ✓ |
+| 15 | `airflow.operators.python` используется только как fallback для Airflow 2.x | ✓ |
+
+### Подтверждённая работа в обоих режимах импорта
+
+| Сценарий | `_USE_SDK` | DAG-импорт | Variable-импорт | BaseHook-импорт | `Variable.get` сигнатура |
+|---|---|---|---|---|---|
+| Airflow 3.x (есть `airflow.sdk`) | `True` | `airflow.sdk.DAG` | `airflow.sdk.Variable` | `airflow.sdk.bases.hook.BaseHook` | `default=` |
+| Airflow 2.x (нет `airflow.sdk`) | `False` | `airflow.DAG` | `airflow.models.Variable` | `airflow.hooks.base.BaseHook` | `default_var=` |
+
+## v1.0.7 — фикс несовместимой сигнатуры Variable.get() в Airflow 3 SDK
+
+### Исправления
+
+- **`Variable.get(default_var=...)` → `_var_get()` обёртка.**
+  В Airflow 3 SDK сигнатура `Variable.get()` изменилась: параметр для
+  значения по умолчанию называется **`default`**, а в Airflow 2 legacy
+  API — **`default_var`**. Так как DAG поддерживает обе ветки одновременно
+  (импорт через try/except), один и тот же вызов работать не мог:
+
+  | API | Сигнатура |
+  |---|---|
+  | `airflow.models.Variable.get` (Airflow 2) | `get(key, default_var=...)` |
+  | `airflow.sdk.Variable.get` (Airflow 3) | `get(key, default=...)` |
+
+  Добавлена обёртка `_var_get(key, default)`, которая по флагу `_USE_SDK`
+  (выставляется в зависимости от того, какой импорт сработал) вызывает
+  правильный вариант. Все Variable.get-обращения в `_build_config()`
+  заменены на эту обёртку. Старый код падал в Airflow 3 с
+  `TypeError: Variable.get() got an unexpected keyword argument 'default_var'`.
+
 ## v1.0.6 — поддержка нескольких окружений (TEST + PROD)
 
 ### Изменения

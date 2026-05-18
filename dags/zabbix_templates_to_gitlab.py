@@ -75,14 +75,26 @@ import json
 import logging
 from datetime import datetime, timedelta
 
+# pendulum поставляется вместе с Airflow на любой современной инсталляции —
+# Airflow 3 документация рекомендует использовать pendulum.datetime() с явной
+# таймзоной для start_date (см. "Time zone aware Dags"). Падение в naive
+# datetime — это legacy-поведение, работает, но в логах появляются warnings.
+try:
+    import pendulum
+    _START_DATE = pendulum.datetime(2025, 1, 1, tz="UTC")
+except ImportError:
+    _START_DATE = datetime(2025, 1, 1)
+
 # ── Совместимость импортов между Airflow 2.x и 3.x ────────────────────────────
 try:
     from airflow.sdk import DAG, Variable
     from airflow.sdk.bases.hook import BaseHook
+    _USE_SDK = True
 except ImportError:
     from airflow import DAG  # type: ignore[no-redef]
     from airflow.models import Variable  # type: ignore[no-redef]
     from airflow.hooks.base import BaseHook  # type: ignore[no-redef]
+    _USE_SDK = False
 
 try:
     from airflow.providers.standard.operators.python import PythonOperator
@@ -92,6 +104,19 @@ except ImportError:
 from zabbix_template_sync import SyncConfig, TemplateSynchronizer
 
 log = logging.getLogger(__name__)
+
+
+def _var_get(key: str, default):
+    """
+    Совместимая обёртка для Variable.get().
+
+    В Airflow 3 SDK (airflow.sdk.Variable) параметр называется `default`.
+    В Airflow 2 legacy (airflow.models.Variable) — `default_var`.
+    Скрываем разницу здесь, чтобы остальной код был чистым.
+    """
+    if _USE_SDK:
+        return Variable.get(key, default=default)
+    return Variable.get(key, default_var=default)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -157,7 +182,7 @@ def _build_config(env: str, env_defaults: dict) -> SyncConfig:
     zbx_extra = zbx_conn.extra_dejson or {}
     gl_extra = gl_conn.extra_dejson or {}
 
-    project_id = Variable.get(f"{env}_gitlab_project_id", default_var=None)
+    project_id = _var_get(f"{env}_gitlab_project_id", None)
     if not project_id:
         raise RuntimeError(
             f"Airflow Variable '{env}_gitlab_project_id' не задана. Создайте:\n"
@@ -165,9 +190,7 @@ def _build_config(env: str, env_defaults: dict) -> SyncConfig:
             f"'group/subgroup/project'"
         )
 
-    template_groups_raw = Variable.get(
-        f"{env}_zabbix_sync_template_groups", default_var="[]"
-    )
+    template_groups_raw = _var_get(f"{env}_zabbix_sync_template_groups", "[]")
     try:
         template_groups = json.loads(template_groups_raw) or None
     except json.JSONDecodeError:
@@ -189,24 +212,17 @@ def _build_config(env: str, env_defaults: dict) -> SyncConfig:
         gitlab_url=gl_conn.host,
         gitlab_project_id=project_id,
         gitlab_token=gl_conn.password,
-        gitlab_branch=Variable.get(
-            f"{env}_gitlab_branch", default_var="main"
-        ),
+        gitlab_branch=_var_get(f"{env}_gitlab_branch", "main"),
         gitlab_verify_ssl=bool(gl_extra.get("verify_ssl", True)),
 
         # Логика
-        templates_subdir=Variable.get(
-            f"{env}_zabbix_sync_subdir", default_var="templates"
-        ),
+        templates_subdir=_var_get(f"{env}_zabbix_sync_subdir", "templates"),
         quiet_period_sec=int(
-            Variable.get(
-                f"{env}_zabbix_sync_quiet_period",
-                default_var=str(default_quiet),
-            )
+            _var_get(f"{env}_zabbix_sync_quiet_period", str(default_quiet))
         ),
         template_groups=template_groups,
-        single_commit=Variable.get(
-            f"{env}_zabbix_sync_single_commit", default_var="true"
+        single_commit=_var_get(
+            f"{env}_zabbix_sync_single_commit", "true"
         ).lower() == "true",
 
         commit_author_name=f"Zabbix Sync Bot ({env})",
@@ -281,7 +297,7 @@ def _make_dag(env: str, env_cfg: dict) -> DAG:
         dag_id=f"zabbix_templates_to_gitlab_{env}",
         description=f"Sync Zabbix 7 templates into GitLab as YAML ({env.upper()})",
         default_args=default_args,
-        start_date=datetime(2025, 1, 1),
+        start_date=_START_DATE,
         schedule=env_cfg["schedule"],
         catchup=False,
         max_active_runs=1,
