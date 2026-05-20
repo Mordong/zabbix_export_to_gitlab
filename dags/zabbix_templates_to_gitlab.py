@@ -131,6 +131,9 @@ ENVIRONMENTS = {
         # Default quiet_period, если соответствующая Variable не задана.
         # В TEST разумно 5 мин — изменения должны быстро докатываться.
         "default_quiet_period_sec": 300,
+        # Retry-политика. В TEST оставляем короткую — быстрая обратная связь.
+        "retries": 2,
+        "retry_delay_minutes": 5,
         # Кто получает алерты при сбоях этого DAG'а.
         "owner": "monitoring-team",
         "email": [],  # ["[email protected]"]
@@ -142,6 +145,11 @@ ENVIRONMENTS = {
         "schedule": "*/15 * * * *",
         # PROD — строго 1 час «тишины» по ТЗ.
         "default_quiet_period_sec": 3600,
+        # PROD — больше ретраев и длиннее delay: если Zabbix временно
+        # перегружен, через 5 минут может быть всё ещё нагружен.
+        # 15 мин × 3 = до 45 минут окно попыток после первого падения.
+        "retries": 3,
+        "retry_delay_minutes": 15,
         "owner": "monitoring-team",
         "email": [],  # ["[email protected]"]
         "env_tag": "prod",
@@ -207,6 +215,13 @@ def _build_config(env: str, env_defaults: dict) -> SyncConfig:
         zabbix_user=zbx_conn.login,
         zabbix_password=zbx_conn.password,
         zabbix_verify_ssl=bool(zbx_extra.get("verify_ssl", True)),
+        # Производительность Zabbix API (см. SyncConfig для смысла каждого):
+        zabbix_timeout_sec=int(
+            _var_get(f"{env}_zabbix_timeout_sec", "60")
+        ),
+        zabbix_audit_timeout_sec=int(
+            _var_get(f"{env}_zabbix_audit_timeout_sec", "180")
+        ),
 
         # GitLab
         gitlab_url=gl_conn.host,
@@ -221,6 +236,13 @@ def _build_config(env: str, env_defaults: dict) -> SyncConfig:
             _var_get(f"{env}_zabbix_sync_quiet_period", str(default_quiet))
         ),
         template_groups=template_groups,
+        # Окно и лимит auditlog.get запроса (см. SyncConfig):
+        audit_window_padding_sec=int(
+            _var_get(f"{env}_audit_window_padding_sec", "900")
+        ),
+        audit_query_limit=int(
+            _var_get(f"{env}_audit_query_limit", "5000")
+        ),
         single_commit=_var_get(
             f"{env}_zabbix_sync_single_commit", "true"
         ).lower() == "true",
@@ -289,8 +311,9 @@ def _make_dag(env: str, env_cfg: dict) -> DAG:
         "email": env_cfg.get("email", []),
         "email_on_failure": bool(env_cfg.get("email")),
         "email_on_retry": False,
-        "retries": 2,
-        "retry_delay": timedelta(minutes=5),
+        # Берём из ENVIRONMENTS — у TEST/PROD разные retry-политики.
+        "retries": env_cfg.get("retries", 2),
+        "retry_delay": timedelta(minutes=env_cfg.get("retry_delay_minutes", 5)),
     }
 
     dag = DAG(

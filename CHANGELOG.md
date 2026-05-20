@@ -2,6 +2,63 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.1.0 — устойчивость к нагрузке Zabbix (timeout/retry tuning)
+
+После эпизодов `TimeoutError` в PROD-DAG на запросе `auditlog.get`
+(инсталляция ~10.4 млн записей в audit log, активные правки) — комплекс
+изменений, делающий синхронизацию устойчивой к временной нагрузке на
+Zabbix-сервер. Существующая логика (правило отсрочки на час, short-circuit
+DEFER) не меняется.
+
+### Изменения параметров (с дефолтами)
+
+| Параметр | Было | Стало | Variable |
+|---|---|---|---|
+| Базовый таймаут Zabbix API | 30 с | 60 с | `<env>_zabbix_timeout_sec` |
+| Таймаут `auditlog.get` | 30 с | 180 с | `<env>_zabbix_audit_timeout_sec` |
+| Окно `auditlog.get` запроса | `max(2×quiet_period, 7200)` (PROD: 7200 с) | `quiet_period + padding` (PROD: 4500 с) | — |
+| Padding окна | (хардкод) | 900 с | `<env>_audit_window_padding_sec` |
+| Лимит `auditlog.get` | 50000 | 5000 | `<env>_audit_query_limit` |
+| Retries PROD | 2 | 3 | в `ENVIRONMENTS` |
+| Retry delay PROD | 5 мин | 15 мин | в `ENVIRONMENTS` |
+| Retries TEST | 2 | 2 (без изменений) | в `ENVIRONMENTS` |
+| Retry delay TEST | 5 мин | 5 мин (без изменений) | в `ENVIRONMENTS` |
+
+### Изменения в коде
+
+- **`ZabbixAPI._call()`** — добавлен опциональный параметр `timeout_override`,
+  позволяющий перекрыть базовый таймаут для конкретного запроса. Используется
+  для `auditlog.get`.
+- **`ZabbixAPI.get_recently_modified_templates()`** — теперь принимает
+  параметры `audit_timeout` и `limit`.
+- **`SyncConfig`** — добавлены 4 новых поля: `zabbix_timeout_sec`,
+  `zabbix_audit_timeout_sec`, `audit_window_padding_sec`, `audit_query_limit`.
+- **DAG** — все 4 параметра конфигурируются через Airflow Variables
+  с префиксом среды; retries и retry_delay вынесены в `ENVIRONMENTS`
+  с разделением TEST/PROD.
+- **`ZabbixAPI._call()` → handler для `TimeoutError`** — отдельная ветка,
+  выдающая понятное сообщение с конкретными CLI-командами для подстройки
+  таймаутов/окна/лимита через Airflow Variables. Раньше был криптический
+  stacktrace на 15 строк.
+
+### Совместимость с предыдущими версиями
+
+Полностью обратно-совместимо. Если новые Variables не созданы — используются
+дефолты в коде. Чтобы получить новые значения для PROD, дополнительных
+действий не требуется — дефолты применятся автоматически.
+
+При желании можно настроить под конкретную нагрузку:
+```bash
+# Если timeout таки случается — поднять выше:
+airflow variables set prod_zabbix_audit_timeout_sec 300
+
+# Если очень активный audit log — уменьшить окно:
+airflow variables set prod_audit_window_padding_sec 300
+
+# Если в окне реально единицы правок — снизить лимит ещё:
+airflow variables set prod_audit_query_limit 1000
+```
+
 ## v1.0.9 — диагностика сетевых ошибок (SSL, DNS, refused, timeout)
 
 ### Улучшения

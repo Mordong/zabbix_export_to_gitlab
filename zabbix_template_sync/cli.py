@@ -70,6 +70,8 @@ def _config_from_yaml(path: str) -> SyncConfig:
         zabbix_user=z["user"],
         zabbix_password=z["password"],
         zabbix_verify_ssl=bool(z.get("verify_ssl", True)),
+        zabbix_timeout_sec=int(z.get("timeout_sec", 60)),
+        zabbix_audit_timeout_sec=int(z.get("audit_timeout_sec", 180)),
 
         gitlab_url=g["url"],
         gitlab_project_id=str(g["project_id"]),
@@ -81,6 +83,8 @@ def _config_from_yaml(path: str) -> SyncConfig:
         quiet_period_sec=int(s.get("quiet_period_sec", 3600)),
         template_groups=s.get("template_groups") or None,
         template_hosts=s.get("template_hosts") or None,
+        audit_window_padding_sec=int(s.get("audit_window_padding_sec", 900)),
+        audit_query_limit=int(s.get("audit_query_limit", 5000)),
         single_commit=bool(s.get("single_commit", True)),
         commit_author_name=s.get("commit_author_name", "Zabbix Sync Bot"),
         commit_author_email=s.get("commit_author_email", "zabbix-sync@example.com"),

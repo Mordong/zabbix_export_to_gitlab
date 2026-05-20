@@ -7,6 +7,13 @@ zabbix:
   user: api-readonly
   password: "ВАШ_ПАРОЛЬ"
   verify_ssl: true
+  # Базовый HTTP-таймаут к Zabbix API (сек) для обычных вызовов
+  # (template.get, configuration.export и т.п.)
+  timeout_sec: 60
+  # Отдельный, более щедрый таймаут для auditlog.get bulk-запроса —
+  # этот запрос на больших инсталляциях иногда занимает десятки секунд
+  # при холодном кэше БД Zabbix.
+  audit_timeout_sec: 180
 
 gitlab:
   url: https://gitlab.example.com
@@ -28,6 +35,15 @@ sync:
   # в Zabbix, прежде чем закоммитить его обновление в GitLab.
   # 3600 = 1 час (требование ТЗ).
   quiet_period_sec: 3600
+
+  # Окно audit log запроса = quiet_period_sec + audit_window_padding_sec.
+  # Запас на пропущенный запуск DAG; рекомендуется один schedule_interval.
+  # Больше значение → больше данных читает Zabbix → выше риск таймаута.
+  audit_window_padding_sec: 900
+
+  # Верхняя граница записей в одном auditlog.get запросе.
+  # Защита от того, что в окне внезапно окажется аномально много записей.
+  audit_query_limit: 5000
 
   # Опциональные фильтры (закомментируйте, чтобы синхронизировать ВСЕ шаблоны).
   # template_groups:

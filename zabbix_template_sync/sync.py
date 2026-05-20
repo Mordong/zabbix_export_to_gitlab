@@ -53,6 +53,13 @@ class SyncConfig:
     zabbix_user: str
     zabbix_password: str
     zabbix_verify_ssl: bool = True
+    # Базовый таймаут HTTP запросов к Zabbix API (сек). Применяется ко всем
+    # вызовам кроме audit log (тот использует zabbix_audit_timeout_sec).
+    zabbix_timeout_sec: int = 60
+    # Таймаут именно для auditlog.get bulk-запроса. Этот запрос на больших
+    # инсталляциях может занимать значительно дольше остальных — особенно
+    # при холодном кэше БД Zabbix. Поэтому отдельный, заметно более щедрый.
+    zabbix_audit_timeout_sec: int = 180
 
     # GitLab
     gitlab_url: str = "https://gitlab.com"
@@ -66,6 +73,18 @@ class SyncConfig:
     quiet_period_sec: int = DEFAULT_QUIET_PERIOD_SEC
     template_groups: list[str] | None = None    # фильтр по группам шаблонов; None = все
     template_hosts: list[str] | None = None     # фильтр по host-именам; None = все
+
+    # Окно audit log запроса = quiet_period_sec + audit_window_padding_sec.
+    # Запас нужен, чтобы покрыть один-два пропущенных запуска DAG'а
+    # (если он недолго был выключен/упал). Слишком большое значение увеличивает
+    # объём данных, читаемых Zabbix-сервером, и риск таймаута.
+    audit_window_padding_sec: int = 900   # 15 минут — один интервал DAG
+
+    # Верхняя граница записей в одном auditlog.get запросе. Защита от того,
+    # что в окне внезапно окажется аномально много записей и Zabbix-сервер
+    # начнёт материализовывать большой набор. Реально за час правок шаблонов
+    # бывают единицы-десятки, 5000 — с большим запасом.
+    audit_query_limit: int = 5000
 
     # Коммиты
     single_commit: bool = True   # объединять все изменения в один коммит
@@ -97,7 +116,11 @@ class TemplateSynchronizer:
         gl.verify_access()
 
         # 1. Подключаемся к Zabbix и получаем список шаблонов
-        zbx = ZabbixAPI(self.cfg.zabbix_url, verify_ssl=self.cfg.zabbix_verify_ssl)
+        zbx = ZabbixAPI(
+            self.cfg.zabbix_url,
+            verify_ssl=self.cfg.zabbix_verify_ssl,
+            timeout=self.cfg.zabbix_timeout_sec,
+        )
         with zbx:
             zbx.login(self.cfg.zabbix_user, self.cfg.zabbix_password)
             templates = zbx.get_templates(
@@ -119,18 +142,25 @@ class TemplateSynchronizer:
                 len(existing_files),
             )
 
-            # 3. Audit log: один лёгкий запрос за окно «2 × quiet_period» (с запасом).
+            # 3. Audit log: один запрос за окно (quiet_period + padding).
             #    Получаем словарь {templateid: latest_clock} для НЕДАВНО изменённых.
             #    Шаблоны, отсутствующие в словаре, считаем «стабильными»
-            #    (их давно никто не трогал).
-            window = max(2 * self.cfg.quiet_period_sec, 7200)
+            #    (их давно никто не трогал, либо запись уже вычищена housekeeper'ом).
+            #    Параметры audit_window/timeout/limit вынесены в SyncConfig,
+            #    чтобы их можно было подстроить под нагрузку Zabbix без правок кода.
+            window = self.cfg.quiet_period_sec + self.cfg.audit_window_padding_sec
             recent_modified = zbx.get_recently_modified_templates(
-                since=now - window
+                since=now - window,
+                audit_timeout=self.cfg.zabbix_audit_timeout_sec,
+                limit=self.cfg.audit_query_limit,
             )
             log.info(
-                "Audit log: шаблонов с правками за последние %s — %d",
+                "Audit log: шаблонов с правками за последние %s — %d "
+                "(timeout=%ds, limit=%d)",
                 format_duration(window),
                 len(recent_modified),
+                self.cfg.zabbix_audit_timeout_sec,
+                self.cfg.audit_query_limit,
             )
 
             # 4. Итерация по шаблонам, сбор действий

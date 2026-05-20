@@ -188,6 +188,10 @@ airflow variables set prod_zabbix_sync_template_groups '["Templates/OS","Шаб�
 | `<env>_zabbix_sync_quiet_period` | нет | 300 (TEST) / 3600 (PROD) | секунд «тишины» перед коммитом |
 | `<env>_zabbix_sync_template_groups` | нет | `[]` | JSON-массив групп для фильтра |
 | `<env>_zabbix_sync_single_commit` | нет | `true` | объединять изменения в 1 коммит |
+| `<env>_zabbix_timeout_sec` | нет | `60` | базовый HTTP-таймаут к Zabbix API |
+| `<env>_zabbix_audit_timeout_sec` | нет | `180` | таймаут для тяжёлого `auditlog.get` запроса |
+| `<env>_audit_window_padding_sec` | нет | `900` | запас к окну `auditlog.get` сверх `quiet_period` |
+| `<env>_audit_query_limit` | нет | `5000` | верхняя граница записей в одном `auditlog.get` |
 
 ### 4. Настройте расписание / параметры среды в коде DAG'а
 
@@ -234,6 +238,7 @@ ENVIRONMENTS = {
 | `Airflow Variable 'test_gitlab_project_id' не задана` | Не создана обязательная Variable | Создайте её для нужной среды (см. шаг 3) |
 | `Connection 'zabbix_test' не найден` | Не создан Connection | См. шаг 2 для нужной среды |
 | `[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate` | Сертификат Zabbix/GitLab подписан внутренним CA, которого нет в trust store контейнера | Быстро: в Extra Connection-а поставьте `{"verify_ssl": false}`. Правильно: положите CA в `/usr/local/share/ca-certificates/` контейнера и запустите `update-ca-certificates`. |
+| `Запрос '<method>' к Zabbix не уложился в N сек` | Zabbix не успел ответить за таймаут. Чаще всего на `auditlog.get` при большой/нагруженной таблице audit log | Поднять `<env>_zabbix_audit_timeout_sec` (например до 300). Дополнительно — уменьшить `<env>_audit_window_padding_sec` или `<env>_audit_query_limit`. Проверить индексы `auditlog` в Zabbix БД (см. ниже). |
 | `Name or service not known` / DNS-ошибки | Из контейнера Airflow не резолвится hostname | Проверьте DNS и `/etc/resolv.conf`, корпоративные DNS-серверы должны быть доступны воркеру |
 | `Connection refused` | Порт закрыт или сервис не запущен | Проверьте firewall/NAT/маршруты между Airflow worker и Zabbix/GitLab |
 | `TypeError: ... 'schedule_interval'` | Старая версия DAG в Airflow 3 | Берите свежий `zabbix_templates_to_gitlab.py` |

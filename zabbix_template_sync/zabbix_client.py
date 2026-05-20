@@ -43,7 +43,13 @@ class ZabbixAPI:
     Стиль авторизации (Bearer / body.auth) воспроизведён из ZabbixAPI в zabbix_reporter.py.
     """
 
-    def __init__(self, url: str, verify_ssl: bool = True, timeout: int = 30):
+    def __init__(self, url: str, verify_ssl: bool = True, timeout: int = 60):
+        """
+        :param timeout: базовый таймаут для всех JSON-RPC запросов (секунды).
+            Тяжёлые запросы (например auditlog.get) могут переопределять его
+            через параметр timeout_override в _call(); см. также
+            get_recently_modified_templates(audit_timeout).
+        """
         self.url = url.rstrip("/") + "/api_jsonrpc.php"
         self.verify_ssl = verify_ssl
         self.timeout = timeout
@@ -54,7 +60,13 @@ class ZabbixAPI:
     # ──────────────────────────────────────────────────────────────────────────
     # Низкоуровневый JSON-RPC вызов
     # ──────────────────────────────────────────────────────────────────────────
-    def _call(self, method: str, params: Any, _no_auth: bool = False) -> Any:
+    def _call(
+        self,
+        method: str,
+        params: Any,
+        _no_auth: bool = False,
+        timeout_override: int | None = None,
+    ) -> Any:
         body: dict[str, Any] = {
             "jsonrpc": "2.0",
             "method": method,
@@ -83,10 +95,36 @@ class ZabbixAPI:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
+        effective_timeout = timeout_override if timeout_override is not None else self.timeout
+
         try:
-            with urllib.request.urlopen(req, context=ctx, timeout=self.timeout) as r:
+            with urllib.request.urlopen(req, context=ctx, timeout=effective_timeout) as r:
                 # Zabbix всегда отвечает в UTF-8
                 response = json.loads(r.read().decode("utf-8"))
+        except TimeoutError as e:
+            # Соединение установилось, но Zabbix не ответил за отведённое время.
+            # Чаще всего это значит, что запрос дорогой (большая выборка из
+            # auditlog / configuration.export для тяжёлого шаблона) или сам
+            # Zabbix перегружен.
+            log.error(
+                "Zabbix API timeout on %s после %d сек чтения",
+                method, effective_timeout,
+            )
+            raise ConnectionError(
+                f"Запрос '{method}' к Zabbix не уложился в {effective_timeout} сек.\n"
+                f"\n"
+                f"  ВАРИАНТЫ РЕШЕНИЯ:\n"
+                f"  1) Увеличьте таймаут для этой среды:\n"
+                f"     airflow variables set <env>_zabbix_timeout_sec 120         "
+                f"# базовый\n"
+                f"     airflow variables set <env>_zabbix_audit_timeout_sec 300   "
+                f"# для auditlog.get\n"
+                f"  2) Если падает на auditlog.get — уменьшите окно или лимит:\n"
+                f"     airflow variables set <env>_audit_window_padding_sec 300\n"
+                f"     airflow variables set <env>_audit_query_limit 1000\n"
+                f"  3) Проверьте нагрузку на Zabbix-сервер и индексы таблицы auditlog\n"
+                f"     (см. README, раздел «Диагностика проблем»)."
+            ) from e
         except urllib.error.URLError as e:
             reason = e.reason
             log.error("Zabbix API connection error on %s: %s", method, reason)
@@ -130,7 +168,7 @@ class ZabbixAPI:
                 )
             elif "timed out" in reason_str.lower():
                 hint = (
-                    f"\n→ Таймаут подключения. "
+                    f"\n→ Таймаут подключения (не чтения). "
                     f"Проверьте сетевую доступность Zabbix из Airflow worker "
                     f"(firewall, прокси, маршруты)."
                 )
@@ -285,18 +323,32 @@ class ZabbixAPI:
         except (KeyError, TypeError, ValueError):
             return None
 
-    def get_recently_modified_templates(self, since: int) -> dict[str, int]:
+    def get_recently_modified_templates(
+        self,
+        since: int,
+        audit_timeout: int = 180,
+        limit: int = 5000,
+    ) -> dict[str, int]:
         """
         Возвращает {templateid: latest_clock} — словарь шаблонов, у которых
         ЕСТЬ записи в audit log с clock >= since (unix timestamp).
 
         Один лёгкий запрос вместо запросов по каждому шаблону:
         фильтр по resourcetype=TEMPLATE и time_from. Записей за окно
-        в пару часов обычно единицы-десятки, нагрузки практически нет.
+        в час-полтора обычно единицы-десятки, нагрузки практически нет.
 
         Шаблоны, отсутствующие в результате, либо не правились в указанном
         окне, либо были изменены настолько давно, что записи уже вычищены
         housekeeper'ом — в обоих случаях нам они «стабильны».
+
+        :param since: Unix-timestamp, с которого ищем правки.
+        :param audit_timeout: таймаут именно для этого запроса (сек).
+            Может быть кратно больше базового таймаута Zabbix API,
+            т.к. auditlog.get на больших инсталляциях иногда занимает
+            десятки секунд при холодном кэше БД.
+        :param limit: верхняя граница числа возвращаемых записей.
+            Реально за окно в час правок шаблонов бывают единицы-десятки,
+            но запас на случай массовых правок не помешает.
         """
         try:
             records = self._call(
@@ -307,8 +359,9 @@ class ZabbixAPI:
                     "time_from": int(since),
                     "sortfield": "clock",
                     "sortorder": "DESC",
-                    "limit": 50000,  # с большим запасом; обычно записей сильно меньше
+                    "limit": int(limit),
                 },
+                timeout_override=int(audit_timeout),
             )
         except ZabbixAPIError as e:
             log.warning("auditlog.get (bulk): %s", e)
