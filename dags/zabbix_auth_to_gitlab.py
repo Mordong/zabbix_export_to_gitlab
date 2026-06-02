@@ -86,8 +86,7 @@ def _var_get(key: str, default):
 # ──────────────────────────────────────────────────────────────────────────────
 ENVIRONMENTS = {
     "test": {
-        # auth-конфиг меняется редко, но в TEST можно проверять почаще.
-        "schedule": "0 */6 * * *",          # каждые 6 часов
+        "schedule": "0 0 * * *",            # ежедневно в полночь
         "default_quiet_period_sec": 300,    # 5 минут «тишины»
         "retries": 2,
         "retry_delay_minutes": 5,
@@ -96,7 +95,7 @@ ENVIRONMENTS = {
         "env_tag": "test",
     },
     "prod": {
-        "schedule": "@daily",               # раз в день
+        "schedule": "0 0 * * *",            # ежедневно в полночь
         "default_quiet_period_sec": 3600,   # 1 час «тишины»
         "retries": 3,
         "retry_delay_minutes": 15,

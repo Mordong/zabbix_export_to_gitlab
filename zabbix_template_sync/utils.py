@@ -163,6 +163,20 @@ def dump_user_group_mapping_csv(userdirectory: dict[str, Any]) -> str:
     )
     writer.writerow(USER_GROUP_MAPPING_HEADER)
 
+    for pattern, groups_joined, role in _iter_group_mapping_rows(userdirectory):
+        writer.writerow([pattern, groups_joined, role])
+
+    return buf.getvalue()
+
+
+def _iter_group_mapping_rows(userdirectory: dict[str, Any]):
+    """
+    Общий обход provision_groups для CSV и MD: возвращает кортежи
+    (LDAP group pattern, "User groups через запятую", User role).
+
+    Имена резолвятся (_grp_name / _role_name) с fallback на ID. Порядок —
+    как в ответе API (без сортировки), чтобы дифф был стабильным.
+    """
     for pg in userdirectory.get("provision_groups", []) or []:
         pattern = pg.get("name", "")
         role = pg.get("_role_name", "") or pg.get("roleid", "")
@@ -170,9 +184,55 @@ def dump_user_group_mapping_csv(userdirectory: dict[str, Any]) -> str:
             (ug.get("_grp_name", "") or ug.get("usrgrpid", ""))
             for ug in (pg.get("user_groups", []) or [])
         ]
-        writer.writerow([pattern, ",".join(groups), role])
+        yield pattern, ",".join(groups), role
 
-    return buf.getvalue()
+
+def _md_escape(value: str) -> str:
+    """
+    Экранирует значение для ячейки Markdown-таблицы: '|' → '\\|' (иначе
+    разбивает столбцы), переводы строк → пробел (ячейка должна быть в одну
+    строку). Кириллица не трогается.
+    """
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", "")
+
+
+def dump_user_group_mapping_md(userdirectory: dict[str, Any]) -> str:
+    """
+    Строит Markdown-файл маппинга групп для ОДНОГО user directory.
+
+    Структура (UTF-8, переводы строк '\\n'):
+
+        # <имя directory>
+
+        | LDAP group pattern | User groups | User role |
+        | --- | --- | --- |
+        | cn=admins,dc=corp | Zabbix administrators | Super admin role |
+        | cn=ops,dc=corp | Группа А,Группа Б | User role |
+
+    Те же три столбца и те же данные, что и в CSV-варианте
+    (dump_user_group_mapping_csv): User groups перечисляются через запятую,
+    имена резолвятся с fallback на ID, порядок строк — как в ответе API.
+
+    Поведение для пустого provision_groups — единообразно с CSV: выводится
+    заголовок и шапка таблицы без строк данных.
+
+    Символ '|' в значениях экранируется ('\\|'), чтобы не ломать таблицу.
+    """
+    name = userdirectory.get("name") or userdirectory.get("userdirectoryid", "directory")
+    header = " | ".join(USER_GROUP_MAPPING_HEADER)
+    sep = " | ".join(["---"] * len(USER_GROUP_MAPPING_HEADER))
+
+    lines = [
+        f"# {name}",
+        "",
+        f"| {header} |",
+        f"| {sep} |",
+    ]
+    for pattern, groups_joined, role in _iter_group_mapping_rows(userdirectory):
+        cells = " | ".join(_md_escape(c) for c in (pattern, groups_joined, role))
+        lines.append(f"| {cells} |")
+
+    return "\n".join(lines) + "\n"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

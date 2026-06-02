@@ -33,6 +33,7 @@ from .sync import SyncConfig
 from .utils import (
     dump_yaml,
     dump_user_group_mapping_csv,
+    dump_user_group_mapping_md,
     yaml_semantic_equal,
     safe_filename,
     format_duration,
@@ -150,18 +151,27 @@ class AuthSynchronizer:
                     label="userdirectories",
                 )
 
-                # 3. По одному CSV-маппингу групп на каждый directory.
+                # 3. По CSV- и MD-маппингу групп на каждый directory.
                 #    Тот же resourcetype 49 → общее правило отсрочки.
                 for d in userdirs:
                     name = d.get("name") or d.get("userdirectoryid", "directory")
-                    csv_name = f"userdirectory_{safe_filename(str(name))}.csv"
+                    base = f"userdirectory_{safe_filename(str(name))}"
                     self._process_resource(
                         gl=gl, zbx=zbx, now=now, window=window, stats=stats,
                         actions=actions,
-                        file_name=csv_name,
+                        file_name=f"{base}.csv",
                         resourcetype=AUDIT_RESOURCE_USERDIRECTORY,
                         new_content=dump_user_group_mapping_csv(d),
                         label=f"csv:{name}",
+                        compare=_text_equal,
+                    )
+                    self._process_resource(
+                        gl=gl, zbx=zbx, now=now, window=window, stats=stats,
+                        actions=actions,
+                        file_name=f"{base}.md",
+                        resourcetype=AUDIT_RESOURCE_USERDIRECTORY,
+                        new_content=dump_user_group_mapping_md(d),
+                        label=f"md:{name}",
                         compare=_text_equal,
                     )
 

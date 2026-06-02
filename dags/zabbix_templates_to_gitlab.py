@@ -126,8 +126,8 @@ def _var_get(key: str, default):
 # поведение под конкретное окружение.
 ENVIRONMENTS = {
     "test": {
-        # Cron-расписание. В TEST можно чаще — для быстрого фидбека на правки.
-        "schedule": "*/5 * * * *",
+        # Cron-расписание.
+        "schedule": "*/30 * * * *",
         # Default quiet_period, если соответствующая Variable не задана.
         # В TEST разумно 5 мин — изменения должны быстро докатываться.
         "default_quiet_period_sec": 300,
@@ -141,8 +141,8 @@ ENVIRONMENTS = {
         "env_tag": "test",
     },
     "prod": {
-        # PROD — каждые 15 минут.
-        "schedule": "*/15 * * * *",
+        # PROD — каждые 30 минут.
+        "schedule": "*/30 * * * *",
         # PROD — строго 1 час «тишины» по ТЗ.
         "default_quiet_period_sec": 3600,
         # PROD — больше ретраев и длиннее delay: если Zabbix временно
