@@ -51,13 +51,29 @@ zabbix-template-sync/
 |---|---|---|
 | `auth/authentication.yaml` | `authentication.get` — глобальные флаги LDAP/SAML, JIT, политика паролей | 42 (Authentication) |
 | `auth/userdirectories.yaml` | `userdirectory.get` — LDAP/SAML серверы с `provision_groups`/`provision_media` | 49 (User directory) |
+| `auth/userdirectory_<имя>.csv` | то же, маппинг групп в CSV (по файлу на каждый directory) | 49 (User directory) |
 
 В provision-mapping рядом с сырыми ID (`roleid`, `usrgrpid`, `mediatypeid`)
 добавлены резолвленные имена в полях `_role_name` / `_grp_name` / `_mt_name` —
 YAML остаётся читаемым, но исходные ID не теряются.
 
+Дополнительно для каждого directory выгружается CSV-маппинг групп
+`auth/userdirectory_<имя>.csv` (имя через `safe_filename`, кириллица
+сохраняется) — три столбца через `;`:
+
+```
+LDAP group pattern;User groups;User role
+cn=admins,ou=groups,dc=corp;Zabbix administrators;Super admin role
+cn=ops,dc=corp;Группа А,Группа Б;User role
+```
+
+`User groups` перечисляются через запятую. Кодировка UTF-8 без BOM; значения
+с `;` или `,` квотируются автоматически. Если у directory нет
+provision_groups — в файле только строка заголовков.
+
 Правило отсрочки (quiet period) работает так же, как для шаблонов, но
 раздельно по каждому файлу, через свой тип ресурса audit log (42 и 49).
+CSV подчиняются тому же правилу, что и `userdirectories.yaml` (resourcetype 49).
 Поскольку auth-конфиг меняется редко, для него отдельный DAG с более редким
 расписанием (PROD — `@daily`, TEST — каждые 6 часов).
 

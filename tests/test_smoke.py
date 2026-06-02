@@ -81,7 +81,8 @@ def test_auth_create_when_absent() -> None:
     with patch("zabbix_template_sync.auth_sync.GitLabClient", return_value=gl), \
          patch("zabbix_template_sync.auth_sync.ZabbixAPI", return_value=_fake_zbx()):
         s = AuthSynchronizer(_cfg()).run()
-    assert s.created == ["authentication.yaml", "userdirectories.yaml"], s.created
+    assert s.created == ["authentication.yaml", "userdirectories.yaml",
+                         "userdirectory_Корп_LDAP.csv"], s.created
     paths = [a["file_path"] for a in cap["actions"]]
     assert all(p.startswith("auth/") for p in paths), paths
     ud = cap["actions"][1]["content"]
@@ -91,18 +92,21 @@ def test_auth_create_when_absent() -> None:
 
 def test_auth_unchanged() -> None:
     from zabbix_template_sync import AuthSynchronizer
-    from zabbix_template_sync.utils import dump_yaml
+    from zabbix_template_sync.utils import dump_yaml, dump_user_group_mapping_csv
     zbx = _fake_zbx()
+    dirs = zbx.get_userdirectories.return_value
     existing = {
         "auth/authentication.yaml": dump_yaml({"authentication": zbx.get_authentication.return_value}),
-        "auth/userdirectories.yaml": dump_yaml({"userdirectories": zbx.get_userdirectories.return_value}),
+        "auth/userdirectories.yaml": dump_yaml({"userdirectories": dirs}),
+        "auth/userdirectory_Корп_LDAP.csv": dump_user_group_mapping_csv(dirs[0]),
     }
     gl = MagicMock()
     gl.get_file_content.side_effect = lambda p: existing.get(p)
     with patch("zabbix_template_sync.auth_sync.GitLabClient", return_value=gl), \
          patch("zabbix_template_sync.auth_sync.ZabbixAPI", return_value=zbx):
         s = AuthSynchronizer(_cfg()).run()
-    assert sorted(s.unchanged) == ["authentication.yaml", "userdirectories.yaml"], s.unchanged
+    assert sorted(s.unchanged) == ["authentication.yaml", "userdirectories.yaml",
+                                   "userdirectory_Корп_LDAP.csv"], s.unchanged
     assert not s.created and not s.updated
     zbx.get_latest_audit_clock.assert_not_called()
     print("  test_auth_unchanged: OK")
@@ -113,6 +117,9 @@ def test_auth_defer_and_update() -> None:
     old = {
         "auth/authentication.yaml": "authentication:\n  ldap_auth_enabled: '0'\n",
         "auth/userdirectories.yaml": "userdirectories: []\n",
+        # CSV тоже присутствует в GitLab, но с другим содержимым →
+        # участвует в правиле отсрочки наравне с YAML.
+        "auth/userdirectory_Корп_LDAP.csv": "LDAP group pattern;User groups;User role\n",
     }
     # DEFER: правка минуту назад
     gl = MagicMock()
@@ -122,7 +129,7 @@ def test_auth_defer_and_update() -> None:
     with patch("zabbix_template_sync.auth_sync.GitLabClient", return_value=gl), \
          patch("zabbix_template_sync.auth_sync.ZabbixAPI", return_value=zbx):
         s = AuthSynchronizer(_cfg()).run()
-    assert len(s.deferred) == 2 and not s.updated, (s.deferred, s.updated)
+    assert len(s.deferred) == 3 and not s.updated, (s.deferred, s.updated)
 
     # UPDATE: правка 2 часа назад
     gl2 = MagicMock()
@@ -132,7 +139,8 @@ def test_auth_defer_and_update() -> None:
     with patch("zabbix_template_sync.auth_sync.GitLabClient", return_value=gl2), \
          patch("zabbix_template_sync.auth_sync.ZabbixAPI", return_value=zbx2):
         s2 = AuthSynchronizer(_cfg()).run()
-    assert sorted(s2.updated) == ["authentication.yaml", "userdirectories.yaml"], s2.updated
+    assert sorted(s2.updated) == ["authentication.yaml", "userdirectories.yaml",
+                                  "userdirectory_Корп_LDAP.csv"], s2.updated
     print("  test_auth_defer_and_update: OK")
 
 
@@ -227,6 +235,84 @@ def test_dags_register_both_branches() -> None:
     print("  test_dags_register_both_branches: OK")
 
 
+def test_csv_mapping_basic_and_quoting() -> None:
+    """CSV маппинга групп: разделитель ';', запятые в группах, квотирование."""
+    import csv as _csv
+    import io as _io
+    from zabbix_template_sync.utils import dump_user_group_mapping_csv
+
+    ud = {"provision_groups": [
+        {"name": "cn=admins", "_role_name": "Super admin role",
+         "user_groups": [{"_grp_name": "Zabbix administrators"}, {"_grp_name": "Группа Б"}]},
+        {"name": "cn=weird;grp", "_role_name": "Роль; точка с запятой",
+         "user_groups": [{"_grp_name": "Группа, с запятой"}]},
+    ]}
+    out = dump_user_group_mapping_csv(ud)
+    # без BOM, только \n
+    assert "\ufeff" not in out and "\r" not in out, "UTF-8 без BOM, переводы \\n"
+    rows = list(_csv.reader(_io.StringIO(out), delimiter=";"))
+    assert rows[0] == ["LDAP group pattern", "User groups", "User role"]
+    # группы через запятую, кириллица сохранена
+    assert rows[1] == ["cn=admins", "Zabbix administrators,Группа Б", "Super admin role"]
+    # имена с ';' квотируются и парсятся обратно корректно
+    assert rows[2] == ["cn=weird;grp", "Группа, с запятой", "Роль; точка с запятой"], rows[2]
+    print("  test_csv_mapping_basic_and_quoting: OK")
+
+
+def test_csv_mapping_empty_and_fallback() -> None:
+    """Пустые provision_groups → только шапка; нет имён → fallback на ID."""
+    from zabbix_template_sync.utils import dump_user_group_mapping_csv
+
+    assert dump_user_group_mapping_csv({"provision_groups": []}) == \
+        "LDAP group pattern;User groups;User role\n"
+    assert dump_user_group_mapping_csv({}) == \
+        "LDAP group pattern;User groups;User role\n"
+
+    ud = {"provision_groups": [
+        {"name": "cn=x", "roleid": "3", "user_groups": [{"usrgrpid": "7"}]}]}
+    out = dump_user_group_mapping_csv(ud)
+    assert out.endswith("cn=x;7;3\n"), repr(out)
+    print("  test_csv_mapping_empty_and_fallback: OK")
+
+
+def test_auth_creates_csv_per_directory() -> None:
+    """AuthSynchronizer создаёт по CSV на каждый directory с safe_filename."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync import AuthSynchronizer
+
+    dir1 = {"userdirectoryid": "3", "name": "Корп LDAP", "provision_media": [],
+            "provision_groups": [{"name": "cn=a", "_role_name": "Super admin role",
+                "user_groups": [{"_grp_name": "Zabbix administrators"}]}]}
+    dir2 = {"userdirectoryid": "5", "name": "SAML Prod",
+            "provision_groups": [], "provision_media": []}
+
+    zbx = MagicMock()
+    zbx.__enter__ = lambda s: zbx
+    zbx.__exit__ = lambda *a: None
+    zbx.get_authentication.return_value = {"ldap_auth_enabled": "1"}
+    zbx.get_userdirectories.return_value = [dir1, dir2]
+
+    gl = MagicMock()
+    gl.get_file_content.return_value = None
+    cap = {}
+    gl.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap.update(a=actions)
+
+    with patch("zabbix_template_sync.auth_sync.GitLabClient", return_value=gl), \
+         patch("zabbix_template_sync.auth_sync.ZabbixAPI", return_value=zbx):
+        AuthSynchronizer(_cfg()).run()
+
+    paths = sorted(a["file_path"] for a in cap["a"])
+    assert "auth/userdirectory_Корп_LDAP.csv" in paths, paths
+    assert "auth/userdirectory_SAML_Prod.csv" in paths, paths
+    # CSV для пустого directory — только шапка
+    empty = [a["content"] for a in cap["a"]
+             if a["file_path"] == "auth/userdirectory_SAML_Prod.csv"][0]
+    assert empty == "LDAP group pattern;User groups;User role\n", repr(empty)
+    # userdirectories.yaml получен одним вызовом API
+    zbx.get_userdirectories.assert_called_once()
+    print("  test_auth_creates_csv_per_directory: OK")
+
+
 def main() -> int:
     tests = [
         test_package_imports,
@@ -234,6 +320,9 @@ def main() -> int:
         test_auth_create_when_absent,
         test_auth_unchanged,
         test_auth_defer_and_update,
+        test_csv_mapping_basic_and_quoting,
+        test_csv_mapping_empty_and_fallback,
+        test_auth_creates_csv_per_directory,
         test_dags_register_both_branches,
     ]
     print(f"Running {len(tests)} smoke tests…")

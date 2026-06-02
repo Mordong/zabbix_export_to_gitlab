@@ -30,7 +30,13 @@ from typing import Any
 
 from .gitlab_client import GitLabClient
 from .sync import SyncConfig
-from .utils import dump_yaml, yaml_semantic_equal, format_duration
+from .utils import (
+    dump_yaml,
+    dump_user_group_mapping_csv,
+    yaml_semantic_equal,
+    safe_filename,
+    format_duration,
+)
 from .zabbix_client import (
     ZabbixAPI,
     AUDIT_RESOURCE_AUTHENTICATION,
@@ -42,6 +48,11 @@ log = logging.getLogger(__name__)
 # Имена файлов в поддиректории auth/ (см. модульный docstring).
 AUTH_FILE = "authentication.yaml"
 USERDIR_FILE = "userdirectories.yaml"
+
+
+def _text_equal(a: str, b: str) -> bool:
+    """Побайтовое сравнение для не-YAML файлов (CSV)."""
+    return a == b
 
 
 @dataclass
@@ -115,19 +126,44 @@ class AuthSynchronizer:
                 actions=actions,
                 file_name=AUTH_FILE,
                 resourcetype=AUDIT_RESOURCE_AUTHENTICATION,
-                fetch=lambda: {"authentication": zbx.get_authentication()},
+                new_content=dump_yaml({"authentication": zbx.get_authentication()}),
                 label="authentication",
             )
 
-            # 2. userdirectories.yaml (resourcetype 49)
-            self._process_resource(
-                gl=gl, zbx=zbx, now=now, window=window, stats=stats,
-                actions=actions,
-                file_name=USERDIR_FILE,
-                resourcetype=AUDIT_RESOURCE_USERDIRECTORY,
-                fetch=lambda: {"userdirectories": zbx.get_userdirectories()},
-                label="userdirectories",
-            )
+            # 2. userdirectories.yaml (resourcetype 49).
+            #    Результат get_userdirectories() переиспользуем для CSV ниже,
+            #    чтобы не делать второй вызов API.
+            try:
+                userdirs = zbx.get_userdirectories()
+            except Exception as e:  # noqa: BLE001
+                log.error("Ошибка экспорта userdirectories из Zabbix: %s", e)
+                stats.errors.append((USERDIR_FILE, f"export: {e}"))
+                userdirs = None
+
+            if userdirs is not None:
+                self._process_resource(
+                    gl=gl, zbx=zbx, now=now, window=window, stats=stats,
+                    actions=actions,
+                    file_name=USERDIR_FILE,
+                    resourcetype=AUDIT_RESOURCE_USERDIRECTORY,
+                    new_content=dump_yaml({"userdirectories": userdirs}),
+                    label="userdirectories",
+                )
+
+                # 3. По одному CSV-маппингу групп на каждый directory.
+                #    Тот же resourcetype 49 → общее правило отсрочки.
+                for d in userdirs:
+                    name = d.get("name") or d.get("userdirectoryid", "directory")
+                    csv_name = f"userdirectory_{safe_filename(str(name))}.csv"
+                    self._process_resource(
+                        gl=gl, zbx=zbx, now=now, window=window, stats=stats,
+                        actions=actions,
+                        file_name=csv_name,
+                        resourcetype=AUDIT_RESOURCE_USERDIRECTORY,
+                        new_content=dump_user_group_mapping_csv(d),
+                        label=f"csv:{name}",
+                        compare=_text_equal,
+                    )
 
         # 3. Применяем накопленные действия.
         self._apply_actions(gl, actions, stats)
@@ -144,12 +180,18 @@ class AuthSynchronizer:
         actions: list[dict[str, Any]],
         file_name: str,
         resourcetype: int,
-        fetch,
+        new_content: str,
         label: str,
+        compare=yaml_semantic_equal,
     ) -> None:
         """
-        Обрабатывает один ресурс (один файл): экспорт → сравнение → решение
-        с учётом правила отсрочки по audit log.
+        Обрабатывает один файл: сравнение с GitLab → решение с учётом правила
+        отсрочки по audit log.
+
+        :param new_content: уже сериализованное содержимое (YAML или CSV).
+        :param compare: функция сравнения текущего и нового содержимого.
+            По умолчанию yaml_semantic_equal (для YAML); для CSV передаётся
+            _text_equal (побайтовое сравнение строк).
         """
         file_path = self._path(file_name)
 
@@ -161,30 +203,20 @@ class AuthSynchronizer:
             stats.errors.append((file_name, f"gitlab read: {e}"))
             return
 
-        # Экспортируем данные ресурса из Zabbix.
-        try:
-            data = fetch()
-        except Exception as e:  # noqa: BLE001
-            log.error("Ошибка экспорта %s из Zabbix: %s", label, e)
-            stats.errors.append((file_name, f"export: {e}"))
-            return
-
-        new_yaml = dump_yaml(data)
-
         # Файла нет → создаём СРАЗУ (как и для новых шаблонов).
         if current is None:
             log.info("[NEW]    %s", file_path)
             actions.append({
                 "action": "create",
                 "file_path": file_path,
-                "content": new_yaml,
+                "content": new_content,
                 "_file": file_name,
                 "_kind": "created",
             })
             return
 
         # Содержимое совпадает — ничего не делаем.
-        if yaml_semantic_equal(current, new_yaml):
+        if compare(current, new_content):
             stats.unchanged.append(file_name)
             return
 
@@ -206,7 +238,7 @@ class AuthSynchronizer:
             actions.append({
                 "action": "update",
                 "file_path": file_path,
-                "content": new_yaml,
+                "content": new_content,
                 "_file": file_name,
                 "_kind": "updated",
             })
@@ -221,7 +253,7 @@ class AuthSynchronizer:
             actions.append({
                 "action": "update",
                 "file_path": file_path,
-                "content": new_yaml,
+                "content": new_content,
                 "_file": file_name,
                 "_kind": "updated",
             })

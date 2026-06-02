@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import re
 import unicodedata
 from typing import Any
@@ -119,6 +121,58 @@ def dump_yaml(data: Any) -> str:
         default_flow_style=False,
         width=4096,
     )
+
+
+# Заголовки CSV-файла маппинга групп (английские, через ';').
+USER_GROUP_MAPPING_HEADER = ["LDAP group pattern", "User groups", "User role"]
+
+
+def dump_user_group_mapping_csv(userdirectory: dict[str, Any]) -> str:
+    """
+    Строит CSV-маппинг групп для ОДНОГО user directory.
+
+    Формат (разделитель ';', кодировка UTF-8 без BOM):
+
+        LDAP group pattern;User groups;User role
+        cn=admins,ou=groups,dc=corp;Zabbix administrators;Super admin role
+        cn=ops,ou=groups,dc=corp;Group A,Group B;User role
+
+    Столбцы:
+      - LDAP group pattern — provision_groups[].name (паттерн сопоставления);
+      - User groups        — имена user-групп (_grp_name) через запятую;
+      - User role          — имя роли (_role_name).
+
+    Поведение:
+      - порядок строк сохраняется как в ответе API (без сортировки);
+      - если provision_groups пуст — возвращается только строка заголовков;
+      - значения с ';', ',', кавычками или переносом строки квотируются
+        стандартным модулем csv автоматически (поэтому запятые-разделители
+        внутри "User groups" не ломают структуру файла);
+      - переводы строк — '\\n' (lineterminator), чтобы дифф в git был
+        стабильным независимо от ОС, на которой выполняется экспорт.
+
+    Возвращает строку (str). Записывать в файл/GitLab нужно как UTF-8.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(
+        buf,
+        delimiter=";",
+        quotechar='"',
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+    )
+    writer.writerow(USER_GROUP_MAPPING_HEADER)
+
+    for pg in userdirectory.get("provision_groups", []) or []:
+        pattern = pg.get("name", "")
+        role = pg.get("_role_name", "") or pg.get("roleid", "")
+        groups = [
+            (ug.get("_grp_name", "") or ug.get("usrgrpid", ""))
+            for ug in (pg.get("user_groups", []) or [])
+        ]
+        writer.writerow([pattern, ",".join(groups), role])
+
+    return buf.getvalue()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
