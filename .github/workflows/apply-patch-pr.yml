@@ -1,0 +1,126 @@
+name: Apply patch and open PR
+
+# Вариант B + ручной запуск (workflow_dispatch).
+# Кладёте .patch-файл в каталог patches/ (через обычный PR или коммит),
+# затем запускаете этот workflow кнопкой "Run workflow" в разделе Actions.
+#
+# Workflow:
+#   1. checkout базовой ветки (по умолчанию test);
+#   2. создаёт новую ветку;
+#   3. применяет patches/<file> через git apply;
+#   4. прогоняет проверки (compile + AST + smoke-тесты);
+#   5. при успехе пушит ветку и открывает обычный (не draft) PR в test.
+#
+# Секреты наружу не утекают: используется встроенный GITHUB_TOKEN,
+# доступный только внутри GitHub Actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_file:
+        description: "Имя .patch файла внутри patches/"
+        required: true
+        default: "auth-ldap-export.patch"
+      base_branch:
+        description: "Целевая ветка PR"
+        required: true
+        default: "test"
+
+# Право на запись в содержимое (push ветки) и на создание PR.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  apply-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyYAML
+
+      - name: Verify patch exists
+        run: |
+          PATCH="patches/${{ github.event.inputs.patch_file }}"
+          if [ ! -f "$PATCH" ]; then
+            echo "::error::Файл $PATCH не найден в каталоге patches/."
+            exit 1
+          fi
+          echo "PATCH=$PATCH" >> "$GITHUB_ENV"
+
+      - name: Create working branch
+        run: |
+          BRANCH="auto/$(basename "${{ github.event.inputs.patch_file }}" .patch)-${GITHUB_RUN_ID}"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+      - name: Apply patch
+        run: |
+          # Пытаемся git am (сохраняет авторство/сообщение коммита),
+          # при неудаче — git apply + отдельный коммит.
+          if git am --3way "$PATCH"; then
+            echo "Применено через git am."
+          else
+            git am --abort || true
+            echo "git am не сработал, пробуем git apply."
+            git apply --3way "$PATCH"
+            git add -A
+            git commit -m "Apply ${{ github.event.inputs.patch_file }}"
+          fi
+
+      - name: Verify — compile all modules
+        run: |
+          python -m py_compile zabbix_template_sync/*.py dags/*.py
+          echo "compile OK"
+
+      - name: Verify — AST sanity of DAGs
+        run: |
+          python - <<'PY'
+          import ast, glob, sys
+          fails = []
+          for f in glob.glob("dags/*.py"):
+              src = open(f, encoding="utf-8").read()
+              ast.parse(src)
+              if "schedule_interval" in src:
+                  fails.append(f"{f}: uses removed schedule_interval")
+              if "schedule=" not in src:
+                  fails.append(f"{f}: missing schedule=")
+          if fails:
+              print("\n".join(fails)); sys.exit(1)
+          print("DAG AST checks OK")
+          PY
+
+      - name: Verify — smoke tests
+        run: |
+          if [ -f tests/test_smoke.py ]; then
+            python tests/test_smoke.py
+          else
+            echo "::warning::tests/test_smoke.py отсутствует в патче — пропускаю smoke-тесты."
+          fi
+
+      - name: Push branch
+        run: git push --set-upstream origin "$BRANCH"
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base "${{ github.event.inputs.base_branch }}" \
+            --head "$BRANCH" \
+            --title "feat: export Zabbix LDAP/SAML auth config to GitLab as YAML" \
+            --body-file .github/pr_body.md
