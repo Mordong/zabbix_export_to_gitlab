@@ -96,6 +96,31 @@ def yaml_semantic_equal(a: str, b: str) -> bool:
     return _strip_volatile(da) == _strip_volatile(db)
 
 
+def dump_yaml(data: Any) -> str:
+    """
+    Сериализует Python-структуру (dict/list) в стабильный YAML.
+
+    Используется для auth-экспорта (authentication / userdirectories), где
+    мы сами строим документ из ответа API, а не получаем готовый YAML от
+    Zabbix. Ключевые свойства:
+
+      - allow_unicode=True  — кириллица сохраняется как есть, без \\uXXXX;
+      - sort_keys=True      — порядок ключей детерминирован, поэтому
+                              перестановка полей в ответе API не вызывает
+                              ложных диффов при сравнении с git;
+      - default_flow_style=False — человекочитаемый блочный вид;
+      - width=4096          — длинные строки (DN, фильтры LDAP) не переносятся
+                              в случайных местах, что тоже стабилизирует дифф.
+    """
+    return yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        sort_keys=True,
+        default_flow_style=False,
+        width=4096,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Форматирование
 # ──────────────────────────────────────────────────────────────────────────────

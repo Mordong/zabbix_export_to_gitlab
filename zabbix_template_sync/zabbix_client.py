@@ -23,9 +23,13 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# Тип ресурса в audit log Zabbix 6+/7+: TEMPLATE = 30
-# Источник: zabbix/include/audit.inc.php (AUDIT_RESOURCE_TEMPLATE)
+# Типы ресурсов в audit log Zabbix 7.x.
+# Источник: официальная документация auditlog/object (release/7.4) —
+#   30 - Template, 42 - Authentication, 49 - User directory.
+# Эти коды стабильны в ветке 7.x; проверено по docs Zabbix 7.4.
 AUDIT_RESOURCE_TEMPLATE = 30
+AUDIT_RESOURCE_AUTHENTICATION = 42
+AUDIT_RESOURCE_USERDIRECTORY = 49
 
 # Поддерживаемые форматы экспорта в Zabbix 7.x
 EXPORT_FORMAT_YAML = "yaml"
@@ -379,3 +383,165 @@ class ZabbixAPI:
             if rid not in latest or clock > latest[rid]:
                 latest[rid] = clock
         return latest
+
+    def get_latest_audit_clock(
+        self,
+        resourcetype: int,
+        since: int,
+        audit_timeout: int = 180,
+        limit: int = 5000,
+    ) -> int | None:
+        """
+        Возвращает unix timestamp последней записи audit log заданного
+        resourcetype с clock >= since, либо None если таких записей нет
+        (или если auditlog.get недоступен).
+
+        В отличие от get_recently_modified_templates() здесь не важен
+        resourceid: для глобальной конфигурации (authentication) её просто
+        нет, а для user directories мы синхронизируем их единым файлом и
+        достаточно знать, было ли ВООБЩЕ изменение любого ресурса этого
+        типа в окне. Поэтому отдаём один максимальный clock по всему типу.
+
+        :param resourcetype: код ресурса (см. AUDIT_RESOURCE_* выше).
+        :param since: Unix-timestamp, с которого ищем правки.
+        :param audit_timeout: таймаут именно для этого запроса (сек).
+        :param limit: верхняя граница числа записей в ответе.
+        """
+        try:
+            records = self._call(
+                "auditlog.get",
+                {
+                    "output": ["clock"],
+                    "filter": {"resourcetype": int(resourcetype)},
+                    "time_from": int(since),
+                    "sortfield": "clock",
+                    "sortorder": "DESC",
+                    "limit": int(limit),
+                },
+                timeout_override=int(audit_timeout),
+            )
+        except ZabbixAPIError as e:
+            log.warning(
+                "auditlog.get (resourcetype=%s): %s. "
+                "Правило отсрочки для этого ресурса не будет применено.",
+                resourcetype, e,
+            )
+            return None
+
+        latest: int | None = None
+        for rec in records:
+            try:
+                clock = int(rec["clock"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if latest is None or clock > latest:
+                latest = clock
+        return latest
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Аутентификация и LDAP/SAML user directories
+    # ──────────────────────────────────────────────────────────────────────────
+    def get_authentication(self) -> dict[str, Any]:
+        """
+        Глобальные настройки аутентификации Zabbix (authentication.get).
+        Это одна запись на весь сервер: общие флаги LDAP/SAML, параметры JIT,
+        политика паролей и т.п. Секретов в открытом виде не содержит.
+        """
+        result = self._call("authentication.get", {"output": "extend"})
+        # authentication.get возвращает один объект (dict), не список.
+        if isinstance(result, list):
+            return result[0] if result else {}
+        return result
+
+    def get_userdirectories(self) -> list[dict[str, Any]]:
+        """
+        Все LDAP/SAML user directories с JIT provisioning
+        (provision_groups, provision_media).
+
+        Для каждого provision-mapping рядом с сырыми ID (roleid, usrgrpid,
+        mediatypeid) добавляются резолвленные имена в полях с префиксом '_':
+        _role_name, _grp_name, _mt_name. Это делает YAML читаемым, не теряя
+        исходные ID (как и просил заказчик — «ID + имя рядом»).
+
+        Поведение портировано из проверенного zabbix_reporter.py.
+        bind_password и подобные секреты Zabbix API в ответе не отдаёт
+        (поле приходит пустым), поэтому маскирование не требуется.
+
+        На Zabbix < 6.4 (где нет provisioning) — мягкий fallback: directories
+        возвращаются без provision_*-полей.
+        """
+        try:
+            dirs = self._call("userdirectory.get", {
+                "output": "extend",
+                "selectProvisionMedia": "extend",
+                "selectProvisionGroups": "extend",
+            })
+        except ZabbixAPIError as e:
+            # Старые версии без provisioning — отдаём без selectProvision*
+            if "selectProvision" in str(e) or "unexpected parameter" in str(e).lower():
+                dirs = self._call("userdirectory.get", {"output": "extend"})
+                for d in dirs:
+                    d.setdefault("provision_groups", [])
+                    d.setdefault("provision_media", [])
+            else:
+                raise
+
+        # Собираем ID для резолвинга имён
+        role_ids: set[str] = set()
+        grp_ids: set[str] = set()
+        mt_ids: set[str] = set()
+        for d in dirs:
+            for pg in d.get("provision_groups", []):
+                if pg.get("roleid"):
+                    role_ids.add(pg["roleid"])
+                for ug in pg.get("user_groups", []):
+                    if ug.get("usrgrpid"):
+                        grp_ids.add(ug["usrgrpid"])
+            for pm in d.get("provision_media", []):
+                if pm.get("mediatypeid"):
+                    mt_ids.add(pm["mediatypeid"])
+
+        role_map = self._resolve_names(
+            "role.get", "roleid", "name", role_ids,
+        )
+        grp_map = self._resolve_names(
+            "usergroup.get", "usrgrpid", "name", grp_ids,
+        )
+        mt_map = self._resolve_names(
+            "mediatype.get", "mediatypeid", "name", mt_ids,
+        )
+
+        # Встраиваем имена рядом с ID
+        for d in dirs:
+            for pg in d.get("provision_groups", []):
+                pg["_role_name"] = role_map.get(pg.get("roleid", ""), "")
+                for ug in pg.get("user_groups", []):
+                    ug["_grp_name"] = grp_map.get(ug.get("usrgrpid", ""), "")
+            for pm in d.get("provision_media", []):
+                pm["_mt_name"] = mt_map.get(pm.get("mediatypeid", ""), "")
+
+        return dirs
+
+    def _resolve_names(
+        self,
+        method: str,
+        id_field: str,
+        name_field: str,
+        ids: set[str],
+    ) -> dict[str, str]:
+        """
+        Вспомогательный резолвинг {id: name} через *.get методы.
+        Ошибки доступа не фатальны — возвращаем то, что удалось получить
+        (имена в экспорте опциональны, сырые ID остаются в любом случае).
+        """
+        if not ids:
+            return {}
+        try:
+            rows = self._call(method, {
+                "output": [id_field, name_field],
+                f"{id_field}s": list(ids),
+            })
+            return {r[id_field]: r.get(name_field, "") for r in rows}
+        except ZabbixAPIError as e:
+            log.warning("Резолвинг имён через %s не удался: %s", method, e)
+            return {}
