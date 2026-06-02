@@ -2,6 +2,58 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.2.0 — экспорт настроек аутентификации (LDAP/SAML provisioning/mapping)
+
+Добавлен экспорт настроек аутентификации Zabbix в GitLab в формате YAML,
+параллельно с экспортом шаблонов. Логика портирована из проверенного
+`zabbix_reporter.py`. PDF-экспорт намеренно отложен, чтобы сохранить
+минимализм зависимостей (только PyYAML + urllib).
+
+### Что нового
+
+- **Два YAML-файла в поддиректории `auth/`:**
+  - `auth/authentication.yaml` — глобальные флаги (`authentication.get`);
+  - `auth/userdirectories.yaml` — LDAP/SAML directories с JIT provisioning
+    (`provision_groups`, `provision_media`).
+- **Резолвинг ID + имя.** В provision-mapping рядом с `roleid`/`usrgrpid`/
+  `mediatypeid` добавлены `_role_name`/`_grp_name`/`_mt_name`.
+- **Отдельный DAG** `zabbix_auth_to_gitlab_<env>` с более редким расписанием
+  (PROD `@daily`, TEST каждые 6 часов) — auth-конфиг меняется редко.
+- **CLI-флаги** `--auth` и `--auth-subdir`.
+
+### Изменения в коде
+
+- **`zabbix_client.py`** — константы `AUDIT_RESOURCE_AUTHENTICATION = 42` и
+  `AUDIT_RESOURCE_USERDIRECTORY = 49` (подтверждены по официальной документации
+  auditlog Zabbix 7.4); методы `get_authentication()`, `get_userdirectories()`
+  (с fallback для версий без provisioning), обобщённый
+  `get_latest_audit_clock(resourcetype, ...)` и helper `_resolve_names()`.
+- **`utils.py`** — `dump_yaml()`: стабильная сериализация dict→YAML
+  (`allow_unicode=True`, `sort_keys=True`) для устойчивого диффа.
+- **`auth_sync.py`** (новый) — `AuthSynchronizer`: pre-flight GitLab → экспорт
+  обоих ресурсов → раздельное решение (NEW/UPDATE/DEFER/unchanged) с правилом
+  отсрочки по соответствующему resourcetype. Переиспользует `GitLabClient` и
+  `yaml_semantic_equal`.
+- **`dags/zabbix_auth_to_gitlab.py`** (новый) — самодостаточная DAG-фабрика по
+  тем же паттернам Airflow 3.x, что и DAG шаблонов.
+
+### Правило отсрочки для auth
+
+Применяется раздельно к каждому файлу через свой тип ресурса audit log
+(42 для authentication, 49 для user directory). При недоступности
+`auditlog.get` — fallback на «коммитить любое расхождение», как и у шаблонов.
+
+### Совместимость
+
+- **Zabbix 7.4.5** — resourcetype-коды и форма `auditlog.get`/`userdirectory.get`
+  проверены по документации ветки 7.4.
+- **Airflow 3.1.2** — новый DAG прошёл тот же чек-лист, что и DAG шаблонов
+  (см. v1.0.8): `schedule=`, нет top-level DB-обращений, `airflow.sdk` +
+  legacy fallback, `PythonOperator` из `providers.standard`, обёртка
+  `_var_get`, tz-aware `start_date`, `catchup=False`. Регистрация обоих DAG
+  проверена симуляцией в обеих ветках импорта (SDK / legacy).
+- Полностью обратно-совместимо: синхронизация шаблонов не затронута.
+
 ## v1.1.0 — устойчивость к нагрузке Zabbix (timeout/retry tuning)
 
 После эпизодов `TimeoutError` в PROD-DAG на запросе `auditlog.get`

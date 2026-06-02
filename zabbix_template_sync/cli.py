@@ -21,6 +21,7 @@ import sys
 import yaml
 
 from .sync import SyncConfig, TemplateSynchronizer
+from .auth_sync import AuthSynchronizer
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -103,6 +104,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Игнорировать правило 1 часа — коммитить все изменения сразу. "
              "Используйте при первичной заливке или ручной синхронизации.",
     )
+    p.add_argument(
+        "--auth",
+        action="store_true",
+        help="Синхронизировать настройки аутентификации (LDAP/SAML) "
+             "вместо шаблонов: auth/authentication.yaml + "
+             "auth/userdirectories.yaml.",
+    )
+    p.add_argument(
+        "--auth-subdir",
+        default="auth",
+        help="Поддиректория в репозитории для auth-файлов "
+             "(по умолчанию 'auth'; '' = корень репо). "
+             "Используется только с --auth.",
+    )
     args = p.parse_args(argv)
 
     _setup_logging(args.verbose)
@@ -111,11 +126,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.force_all:
         cfg.quiet_period_sec = 0
 
-    syncer = TemplateSynchronizer(cfg)
+    if args.auth:
+        syncer = AuthSynchronizer(cfg, subdir=args.auth_subdir)
+    else:
+        syncer = TemplateSynchronizer(cfg)
     stats = syncer.run()
 
     print()
-    print("═══ Итоги синхронизации ═══")
+    title = "Итоги синхронизации auth" if args.auth else "Итоги синхронизации"
+    print(f"═══ {title} ═══")
     print(f"  Создано:    {len(stats.created)}")
     if stats.created:
         for h in stats.created:

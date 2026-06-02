@@ -59,3 +59,19 @@ sync:
 
   commit_author_name: "Zabbix Sync Bot"
   commit_author_email: "zabbix-sync@example.com"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Экспорт настроек аутентификации (LDAP/SAML) — используется с флагом --auth:
+#   python -m zabbix_template_sync.cli --config config.yaml --auth
+#
+# Складывает два файла в поддиректорию auth/ репозитория:
+#   auth/authentication.yaml   — глобальные флаги (authentication.get)
+#   auth/userdirectories.yaml  — LDAP/SAML серверы с provision_groups/media
+#
+# Поддиректория задаётся флагом --auth-subdir (по умолчанию "auth";
+# "" = корень репо). Параметры zabbix/gitlab/sync выше переиспользуются:
+# quiet_period_sec, audit_*, single_commit и т.д. работают так же,
+# но правило отсрочки считается по типам ресурса audit log 42 и 49.
+#
+# Учётке Zabbix нужны права на authentication.get и userdirectory.get
+# (и опционально auditlog.get для правила отсрочки) — роль Super admin.

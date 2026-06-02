@@ -29,15 +29,66 @@ zabbix-template-sync/
 │   ├── __init__.py
 │   ├── zabbix_client.py      # JSON-RPC клиент Zabbix (auth по образцу)
 │   ├── gitlab_client.py      # REST клиент GitLab Repository API
-│   ├── sync.py               # Логика синхронизации
-│   ├── utils.py              # safe_filename + сравнение YAML
+│   ├── sync.py               # Логика синхронизации шаблонов
+│   ├── auth_sync.py          # Логика синхронизации настроек аутентификации
+│   ├── utils.py              # safe_filename + сравнение/сериализация YAML
 │   └── cli.py                # python -m zabbix_template_sync.cli
 ├── dags/
-│   └── zabbix_templates_to_gitlab.py    # Airflow DAG
+│   ├── zabbix_templates_to_gitlab.py    # Airflow DAG (шаблоны)
+│   └── zabbix_auth_to_gitlab.py         # Airflow DAG (аутентификация LDAP/SAML)
 ├── config.example.yaml
 ├── requirements.txt
 └── README.md
 ```
+
+## Экспорт настроек аутентификации (LDAP/SAML)
+
+Помимо шаблонов, можно версионировать настройки аутентификации Zabbix —
+глобальные флаги и JIT provisioning/mapping LDAP/SAML серверов. Экспортируются
+два YAML-файла в поддиректорию `auth/`:
+
+| Файл | Источник API | resourcetype в audit log |
+|---|---|---|
+| `auth/authentication.yaml` | `authentication.get` — глобальные флаги LDAP/SAML, JIT, политика паролей | 42 (Authentication) |
+| `auth/userdirectories.yaml` | `userdirectory.get` — LDAP/SAML серверы с `provision_groups`/`provision_media` | 49 (User directory) |
+
+В provision-mapping рядом с сырыми ID (`roleid`, `usrgrpid`, `mediatypeid`)
+добавлены резолвленные имена в полях `_role_name` / `_grp_name` / `_mt_name` —
+YAML остаётся читаемым, но исходные ID не теряются.
+
+Правило отсрочки (quiet period) работает так же, как для шаблонов, но
+раздельно по каждому файлу, через свой тип ресурса audit log (42 и 49).
+Поскольку auth-конфиг меняется редко, для него отдельный DAG с более редким
+расписанием (PROD — `@daily`, TEST — каждые 6 часов).
+
+Секреты (`bind_password` и т.п.) Zabbix API в ответе не отдаёт — поле
+приходит пустым, поэтому маскирование не требуется.
+
+### Запуск через CLI
+
+```bash
+# Синхронизировать auth-конфиг (вместо шаблонов)
+python -m zabbix_template_sync.cli --config config.yaml --auth
+
+# В корень репозитория, а не в auth/
+python -m zabbix_template_sync.cli --config config.yaml --auth --auth-subdir ""
+
+# Первичная заливка — игнорируем правило отсрочки
+python -m zabbix_template_sync.cli --config config.yaml --auth --force-all
+```
+
+### Запуск через Airflow
+
+DAG-файл `dags/zabbix_auth_to_gitlab.py` регистрирует
+`zabbix_auth_to_gitlab_test` и `zabbix_auth_to_gitlab_prod`. Он переиспользует
+те же Connections (`zabbix_<env>`, `gitlab_<env>`) и общую Variable
+`<env>_gitlab_project_id`, что и DAG шаблонов. Дополнительные опциональные
+Variables: `<env>_zabbix_auth_subdir` (default `auth`),
+`<env>_zabbix_auth_quiet_period`, `<env>_zabbix_auth_single_commit`.
+
+Учётке Zabbix для auth-экспорта нужны права на `authentication.get`,
+`userdirectory.get` (и опционально `auditlog.get` для правила отсрочки).
+В Zabbix эти методы доступны роли Super admin.
 
 ## Поддержка кириллицы
 
