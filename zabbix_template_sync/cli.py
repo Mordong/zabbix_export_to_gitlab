@@ -56,6 +56,7 @@ def _config_from_env() -> SyncConfig:
         quiet_period_sec=int(env("QUIET_PERIOD_SEC", "3600")),
         single_commit=env("SINGLE_COMMIT", "true").lower() == "true",
         host_export_batch_size=int(env("HOST_EXPORT_BATCH_SIZE", "500")),
+        zabbix_export_timeout_sec=int(env("ZABBIX_EXPORT_TIMEOUT_SEC", "300")),
     )
 
 
@@ -89,6 +90,7 @@ def _config_from_yaml(path: str) -> SyncConfig:
         audit_query_limit=int(s.get("audit_query_limit", 5000)),
         single_commit=bool(s.get("single_commit", True)),
         host_export_batch_size=int(s.get("host_export_batch_size", 500)),
+        zabbix_export_timeout_sec=int(s.get("zabbix_export_timeout_sec", 300)),
         commit_author_name=s.get("commit_author_name", "Zabbix Sync Bot"),
         commit_author_email=s.get("commit_author_email", "zabbix-sync@example.com"),
     )

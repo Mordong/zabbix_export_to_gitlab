@@ -405,9 +405,10 @@ def test_config_sync_groups_and_layout() -> None:
         )
         from zabbix_template_sync.zabbix_client import ZabbixAPI as _Z
         z.export_hosts_batched.side_effect = (
-            lambda hostids, bs: _Z.export_hosts_batched(
+            lambda hostids, bs, export_timeout=None: _Z.export_hosts_batched(
                 type("X", (), {"export_yaml_by_ids": staticmethod(
-                    lambda key, ids: _BATCH if ids else "")})(), hostids, bs))
+                    lambda key, ids, timeout_override=None: _BATCH if ids else "")})(),
+                hostids, bs, export_timeout=export_timeout))
         z.export_yaml_by_ids.side_effect = (
             lambda key, ids: f"zabbix_export:\n  {key}: {len(ids)}\n" if ids else "")
         z._call.side_effect = lambda m, p: (
@@ -589,7 +590,7 @@ def test_host_batch_export_and_slicing() -> None:
     # Батчинг: 3 хоста, batch_size=2 → ровно 2 вызова configuration.export.
     z = ZabbixAPI.__new__(ZabbixAPI)
     calls = []
-    z.export_yaml_by_ids = lambda key, ids: (calls.append(list(ids)) or BATCH) if ids else ""
+    z.export_yaml_by_ids = lambda key, ids, timeout_override=None: (calls.append(list(ids)) or BATCH) if ids else ""
     list(z.export_hosts_batched(["1", "2", "3"], batch_size=2))
     assert calls == [["1", "2"], ["3"]], calls
 
@@ -599,8 +600,8 @@ def test_host_batch_export_and_slicing() -> None:
         zz.list_hosts.return_value = [{"hostid": "1"}, {"hostid": "2"}, {"hostid": "3"}]
         zz.get_global_macros.return_value = []
         zz._call.side_effect = lambda m, p: []
-        zz.export_yaml_by_ids.side_effect = lambda key, ids: (BATCH if key == "hosts" and ids else "")
-        zz.export_hosts_batched.side_effect = lambda hostids, bs: ZabbixAPI.export_hosts_batched(zz, hostids, bs)
+        zz.export_yaml_by_ids.side_effect = lambda key, ids, timeout_override=None: (BATCH if key == "hosts" and ids else "")
+        zz.export_hosts_batched.side_effect = lambda hostids, bs, export_timeout=None: ZabbixAPI.export_hosts_batched(zz, hostids, bs, export_timeout=export_timeout)
         return zz
     gl = MagicMock(); gl.get_file_content.return_value = None
     cap = {}

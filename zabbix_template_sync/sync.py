@@ -95,6 +95,10 @@ class SyncConfig:
     # Хосты экспортируются пачками (один вызов API на пачку) и нарезаются
     # обратно на файлы — это снимает узкое место при 10–15 тыс. хостов.
     host_export_batch_size: int = 500
+    # Таймаут на один батч-вызов configuration.export для хостов (сек).
+    # Батч тяжелее одиночного экспорта, поэтому таймаут отдельный и больше
+    # обычного (по аналогии с zabbix_audit_timeout_sec у auditlog).
+    zabbix_export_timeout_sec: int = 300
 
 
 class TemplateSynchronizer:

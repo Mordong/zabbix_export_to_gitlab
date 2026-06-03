@@ -2,6 +2,21 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.6.2 — отдельный таймаут под батч-экспорт хостов
+
+Батчевый `configuration.export` отвечает дольше одиночного, поэтому ему задан
+собственный увеличенный таймаут — по аналогии с выделенным таймаутом у
+`auditlog.get`. Раньше батч использовал общий `zabbix_timeout_sec` (60 с) и
+на крупных пачках мог упереться в таймаут.
+
+- Новое поле `SyncConfig.zabbix_export_timeout_sec` (дефолт 300).
+- Проброс: Variable `<env>_zabbix_export_timeout_sec`, env
+  `ZABBIX_EXPORT_TIMEOUT_SEC`, yaml `zabbix_export_timeout_sec`.
+- `export_yaml_by_ids` и `export_hosts_batched` принимают
+  `timeout_override`/`export_timeout`; в `_call` уходит как `timeout_override`.
+- Затронут только батч-экспорт хостов; остальные `configuration.export`
+  (шаблоны, группы, media types) — на обычном таймауте.
+
 ## v1.6.1 — оптимизация экспорта хостов (батчинг)
 
 Исправлено узкое место в `core`-экспорте: при 10–15 тыс. хостов выгрузка

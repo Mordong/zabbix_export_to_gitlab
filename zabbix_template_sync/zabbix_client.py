@@ -664,21 +664,33 @@ class ZabbixAPI:
             "selectFilter": "extend",
         })
 
-    def export_yaml_by_ids(self, option_key: str, ids: list[str]) -> str:
+    def export_yaml_by_ids(
+        self,
+        option_key: str,
+        ids: list[str],
+        timeout_override: int | None = None,
+    ) -> str:
         """
         Обёртка configuration.export для произвольной группы объектов.
 
         :param option_key: ключ в options ('hosts', 'host_groups',
             'template_groups', 'mediaTypes' и т.п. — имена согласно API 7.x).
         :param ids: список id объектов.
+        :param timeout_override: таймаут именно для этого вызова (сек).
+            Используется для тяжёлого батч-экспорта хостов; для остальных
+            вызовов — None (применяется обычный self.timeout).
         Возвращает YAML-строку (UTF-8). Если ids пуст — возвращает ''.
         """
         if not ids:
             return ""
-        result = self._call("configuration.export", {
-            "format": EXPORT_FORMAT_YAML,
-            "options": {option_key: list(ids)},
-        })
+        result = self._call(
+            "configuration.export",
+            {
+                "format": EXPORT_FORMAT_YAML,
+                "options": {option_key: list(ids)},
+            },
+            timeout_override=timeout_override,
+        )
         if not isinstance(result, str):
             raise ZabbixAPIError(
                 f"configuration.export ({option_key}) вернул не строку: "
@@ -698,6 +710,7 @@ class ZabbixAPI:
         self,
         hostids: list[str],
         batch_size: int = 500,
+        export_timeout: int | None = None,
     ):
         """
         Быстрый экспорт множества хостов: configuration.export вызывается
@@ -716,13 +729,18 @@ class ZabbixAPI:
 
         :param hostids: список hostid для экспорта.
         :param batch_size: число хостов на один configuration.export.
+        :param export_timeout: таймаут на каждый батч-вызов (сек). Батчевый
+            экспорт тяжелее одиночного, поэтому ему задаётся отдельный,
+            увеличенный таймаут (по умолчанию — обычный self.timeout, если
+            None). Аналогично выделенному таймауту у auditlog.
         """
         if not hostids:
             return
         bs = max(1, int(batch_size))
         for start in range(0, len(hostids), bs):
             chunk = hostids[start:start + bs]
-            raw = self.export_yaml_by_ids("hosts", chunk)
+            raw = self.export_yaml_by_ids(
+                "hosts", chunk, timeout_override=export_timeout)
             if not raw:
                 continue
             yield from _slice_hosts_export(raw)

@@ -282,7 +282,9 @@ def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem
     # поштучная логика сравнения/коммита (файл на хост) без повторных вызовов.
     hostids = [h["hostid"] for h in zbx.list_hosts()]
     batch_size = getattr(cfg, "host_export_batch_size", 500)
-    for host_name, host_yaml in zbx.export_hosts_batched(hostids, batch_size):
+    export_timeout = getattr(cfg, "zabbix_export_timeout_sec", None)
+    for host_name, host_yaml in zbx.export_hosts_batched(
+            hostids, batch_size, export_timeout=export_timeout):
         fname = safe_filename(host_name)
         items.append(ExportItem(
             f"{folder}/hosts/{fname}.yaml",
