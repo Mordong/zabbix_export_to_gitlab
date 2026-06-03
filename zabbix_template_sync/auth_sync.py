@@ -294,25 +294,29 @@ class AuthSynchronizer:
 
         if self.cfg.single_commit:
             commit_msg = self._compose_commit_message(actions)
-            try:
-                gl.commit_multiple(
-                    actions=[
-                        {
-                            "action": a["action"],
-                            "file_path": a["file_path"],
-                            "content": a["content"],
-                        }
-                        for a in actions
-                    ],
-                    commit_message=commit_msg,
-                    author_name=self.cfg.commit_author_name,
-                    author_email=self.cfg.commit_author_email,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.error("Атомарный коммит auth упал: %s", e)
-                stats.errors.extend((a["_file"], f"commit: {e}") for a in actions)
-                stats.created.clear()
-                stats.updated.clear()
+            failed = gl.commit_multiple(
+                actions=[
+                    {
+                        "action": a["action"],
+                        "file_path": a["file_path"],
+                        "content": a["content"],
+                    }
+                    for a in actions
+                ],
+                commit_message=commit_msg,
+                author_name=self.cfg.commit_author_name,
+                author_email=self.cfg.commit_author_email,
+                chunk_size=self.cfg.commit_chunk_size,
+                max_retries=self.cfg.commit_max_retries,
+            )
+            if failed:
+                # file_path → _file (имя файла) для статистики.
+                path_to_file = {a["file_path"]: a["_file"] for a in actions}
+                failed_files = {path_to_file.get(p, p) for p in failed}
+                stats.errors.extend((f, "commit failed") for f in failed_files)
+                stats.created[:] = [f for f in stats.created if f not in failed_files]
+                stats.updated[:] = [f for f in stats.updated if f not in failed_files]
+                log.error("Не закоммичено auth-файлов: %d", len(failed_files))
         else:
             for a in actions:
                 kind = "Add" if a["action"] == "create" else "Update"

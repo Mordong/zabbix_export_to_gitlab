@@ -179,19 +179,23 @@ class ConfigSynchronizer:
 
         if self.cfg.single_commit:
             msg = self._commit_message(actions)
-            try:
-                gl.commit_multiple(
-                    actions=[{"action": a["action"], "file_path": a["file_path"],
-                              "content": a["content"]} for a in actions],
-                    commit_message=msg,
-                    author_name=self.cfg.commit_author_name,
-                    author_email=self.cfg.commit_author_email,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.error("[%s] Атомарный коммит упал: %s", self.group, e)
-                stats.errors.extend((a["file_path"], f"commit: {e}") for a in actions)
-                stats.created.clear()
-                stats.updated.clear()
+            failed = gl.commit_multiple(
+                actions=[{"action": a["action"], "file_path": a["file_path"],
+                          "content": a["content"]} for a in actions],
+                commit_message=msg,
+                author_name=self.cfg.commit_author_name,
+                author_email=self.cfg.commit_author_email,
+                chunk_size=self.cfg.commit_chunk_size,
+                max_retries=self.cfg.commit_max_retries,
+            )
+            # Неудавшиеся файлы (пачки, не прошедшие после ретраев) —
+            # в ошибки и снять из created/updated.
+            if failed:
+                failed_set = set(failed)
+                stats.errors.extend((p, "commit failed") for p in failed)
+                stats.created[:] = [p for p in stats.created if p not in failed_set]
+                stats.updated[:] = [p for p in stats.updated if p not in failed_set]
+                log.error("[%s] Не закоммичено файлов: %d", self.group, len(failed))
         else:
             for a in actions:
                 kind = "Add" if a["action"] == "create" else "Update"

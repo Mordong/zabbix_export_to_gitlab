@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -281,43 +282,98 @@ class GitLabClient:
         commit_message: str,
         author_email: str | None = None,
         author_name: str | None = None,
-    ) -> dict[str, Any] | None:
+        chunk_size: int = 150,
+        max_retries: int = 3,
+        retry_delay_sec: float = 2.0,
+    ) -> list[str]:
         """
-        Атомарный коммит сразу нескольких файлов через /commits API.
+        Коммит нескольких файлов через /commits API, РАЗБИТЫЙ НА ПАЧКИ.
+
+        Раньше всё уходило одним POST. При тысячах файлов тело запроса
+        становится огромным и отбивается WAF/прокси (например, Qrator) с
+        кодом 413 "Request is too large". Поэтому действия дробятся на пачки
+        по chunk_size и отправляются отдельными коммитами.
+
         actions: список словарей вида
             {"action": "create"|"update"|"delete", "file_path": "...", "content": "..."}
 
-        Используем для пачки шаблонов — один коммит вместо N, экономит
-        и время, и засорение истории репозитория.
+        Поведение при сбое пачки: пачка повторяется до max_retries раз (с
+        паузой retry_delay_sec); если так и не прошла — пути файлов этой пачки
+        добавляются в результат как неудавшиеся, и обработка ПРОДОЛЖАЕТСЯ со
+        следующими пачками (для disaster-recovery важно записать максимум
+        данных, а не падать на первой ошибке).
+
+        Возвращает список file_path, которые НЕ удалось закоммитить (пустой —
+        значит всё успешно). Это сознательное изменение контракта: метод
+        больше не бросает исключение на ошибке коммита, а сообщает о
+        проблемных файлах вызывающему.
         """
         if not actions:
-            return None
-        prepared: list[dict[str, Any]] = []
-        for a in actions:
-            item = {
-                "action": a["action"],
-                "file_path": a["file_path"],
+            return []
+
+        cs = max(1, int(chunk_size))
+        chunks = [actions[i:i + cs] for i in range(0, len(actions), cs)]
+        total = len(chunks)
+        failed: list[str] = []
+
+        for idx, chunk in enumerate(chunks, start=1):
+            prepared: list[dict[str, Any]] = []
+            for a in chunk:
+                item = {"action": a["action"], "file_path": a["file_path"]}
+                if a.get("content") is not None:
+                    item["content"] = base64.b64encode(
+                        a["content"].encode("utf-8")
+                    ).decode("ascii")
+                    item["encoding"] = "base64"
+                prepared.append(item)
+
+            msg = commit_message if total == 1 else f"{commit_message} (part {idx}/{total})"
+            body: dict[str, Any] = {
+                "branch": self.branch,
+                "commit_message": msg,
+                "actions": prepared,
             }
-            if a.get("content") is not None:
-                item["content"] = base64.b64encode(
-                    a["content"].encode("utf-8")
-                ).decode("ascii")
-                item["encoding"] = "base64"
-            prepared.append(item)
+            if author_email:
+                body["author_email"] = author_email
+            if author_name:
+                body["author_name"] = author_name
 
-        body: dict[str, Any] = {
-            "branch": self.branch,
-            "commit_message": commit_message,
-            "actions": prepared,
-        }
-        if author_email:
-            body["author_email"] = author_email
-        if author_name:
-            body["author_name"] = author_name
+            log.info("GitLab COMMIT part %d/%d: %d action(s)", idx, total, len(chunk))
+            if not self._commit_chunk_with_retry(body, max_retries, retry_delay_sec):
+                # Пачка не прошла даже после ретраев — фиксируем её файлы и идём дальше.
+                failed.extend(a["file_path"] for a in chunk)
 
-        log.info("GitLab COMMIT %d action(s): %s", len(actions), commit_message)
-        return self._request(
-            "POST",
-            f"/projects/{self.project_id}/repository/commits",
-            json_body=body,
-        )
+        return failed
+
+    def _commit_chunk_with_retry(
+        self,
+        body: dict[str, Any],
+        max_retries: int,
+        retry_delay_sec: float,
+    ) -> bool:
+        """
+        Шлёт один чанк-коммит с ретраями. Возвращает True при успехе,
+        False — если все попытки исчерпаны.
+        """
+        attempts = max(1, int(max_retries))
+        for attempt in range(1, attempts + 1):
+            try:
+                self._request(
+                    "POST",
+                    f"/projects/{self.project_id}/repository/commits",
+                    json_body=body,
+                )
+                return True
+            except Exception as e:  # noqa: BLE001
+                if attempt < attempts:
+                    log.warning(
+                        "Коммит пачки не удался (попытка %d/%d): %s — повтор через %.1fs",
+                        attempt, attempts, e, retry_delay_sec,
+                    )
+                    time.sleep(retry_delay_sec)
+                else:
+                    log.error(
+                        "Коммит пачки не удался окончательно (%d попыток): %s",
+                        attempts, e,
+                    )
+        return False

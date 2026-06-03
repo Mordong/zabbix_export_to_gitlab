@@ -246,6 +246,8 @@ def _build_config(env: str, env_defaults: dict) -> SyncConfig:
         single_commit=_var_get(
             f"{env}_zabbix_sync_single_commit", "true"
         ).lower() == "true",
+        commit_chunk_size=int(_var_get(f"{env}_commit_chunk_size", "150")),
+        commit_max_retries=int(_var_get(f"{env}_commit_max_retries", "3")),
 
         commit_author_name=f"Zabbix Sync Bot ({env})",
         commit_author_email=f"zabbix-sync-{env}@example.com",

@@ -87,9 +87,13 @@ class SyncConfig:
     audit_query_limit: int = 5000
 
     # Коммиты
-    single_commit: bool = True   # объединять все изменения в один коммит
+    single_commit: bool = True   # объединять изменения в коммиты (чанками)
     commit_author_name: str = "Zabbix Sync Bot"
     commit_author_email: str = "zabbix-sync@example.com"
+    # Чанкование коммитов: при тысячах файлов один POST /commits отбивается
+    # WAF/прокси (Qrator) с 413. Поэтому действия дробятся на пачки.
+    commit_chunk_size: int = 150
+    commit_max_retries: int = 3
 
     # DR-экспорт хостов: число хостов на один configuration.export.
     # Хосты экспортируются пачками (один вызов API на пачку) и нарезаются
@@ -327,26 +331,28 @@ class TemplateSynchronizer:
 
         if self.cfg.single_commit:
             commit_msg = self._compose_commit_message(actions)
-            try:
-                gl.commit_multiple(
-                    actions=[
-                        {
-                            "action": a["action"],
-                            "file_path": a["file_path"],
-                            "content": a["content"],
-                        }
-                        for a in actions
-                    ],
-                    commit_message=commit_msg,
-                    author_name=self.cfg.commit_author_name,
-                    author_email=self.cfg.commit_author_email,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.error("Атомарный коммит упал: %s", e)
-                # Откатываем стат и пишем ошибку
-                stats.errors.extend((a["_host"], f"commit: {e}") for a in actions)
-                stats.created.clear()
-                stats.updated.clear()
+            failed = gl.commit_multiple(
+                actions=[
+                    {
+                        "action": a["action"],
+                        "file_path": a["file_path"],
+                        "content": a["content"],
+                    }
+                    for a in actions
+                ],
+                commit_message=commit_msg,
+                author_name=self.cfg.commit_author_name,
+                author_email=self.cfg.commit_author_email,
+                chunk_size=self.cfg.commit_chunk_size,
+                max_retries=self.cfg.commit_max_retries,
+            )
+            if failed:
+                path_to_host = {a["file_path"]: a["_host"] for a in actions}
+                failed_hosts = {path_to_host.get(p, p) for p in failed}
+                stats.errors.extend((h, "commit failed") for h in failed_hosts)
+                stats.created[:] = [h for h in stats.created if h not in failed_hosts]
+                stats.updated[:] = [h for h in stats.updated if h not in failed_hosts]
+                log.error("Не закоммичено шаблонов: %d", len(failed_hosts))
         else:
             # По одному файлу = по одному коммиту
             for a in actions:

@@ -615,6 +615,35 @@ def test_host_batch_export_and_slicing() -> None:
     print("  test_host_batch_export_and_slicing: OK")
 
 
+def test_chunked_commit_failure_handling() -> None:
+    """commit_multiple возвращает список упавших путей → они уходят в errors."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync.config_sync import ConfigSynchronizer
+
+    def mkz():
+        z = MagicMock(); z.__enter__ = lambda s: z; z.__exit__ = lambda *a: None
+        z.get_roles.return_value = [{"roleid": "1", "name": "R"}]
+        z.get_usergroups.return_value = [{"usrgrpid": "1", "name": "G"}]
+        z.get_users.return_value = [{"userid": "1", "username": "U"}]
+        return z
+
+    gl = MagicMock()
+    gl.get_file_content.return_value = None
+    # commit_multiple сообщает, что один файл не закоммичен.
+    gl.commit_multiple.return_value = ["users/users.yaml"]
+    with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
+         patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
+        s = ConfigSynchronizer(_cfg(), "users").run()
+    # упавший файл — в errors и НЕ в created
+    assert any(p == "users/users.yaml" for p, _ in s.errors), s.errors
+    assert "users/roles.yaml" in s.created
+    assert "users/users.yaml" not in s.created
+    # chunk_size/max_retries проброшены в вызов
+    _, kwargs = gl.commit_multiple.call_args
+    assert "chunk_size" in kwargs and "max_retries" in kwargs
+    print("  test_chunked_commit_failure_handling: OK")
+
+
 def main() -> int:
     tests = [
         test_package_imports,
@@ -630,6 +659,7 @@ def main() -> int:
         test_config_sync_secret_and_skip,
         test_infra_ui_groups_layout_and_secrets,
         test_host_batch_export_and_slicing,
+        test_chunked_commit_failure_handling,
         test_dag_schedules,
         test_dags_register_both_branches,
         test_config_dags_register,
