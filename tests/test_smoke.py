@@ -394,10 +394,20 @@ def test_config_sync_groups_and_layout() -> None:
         z.get_actions.return_value = [{"actionid": "2", "name": "Report"}]
         z.get_global_macros.return_value = [{"macro": "{$X}", "value": "v", "type": "0"}]
         z.list_hosts.return_value = [
-            {"hostid": "10", "host": "srv-01", "name": "S1"},
-            {"hostid": "11", "host": "db/primary", "name": "DB"},
+            {"hostid": "10"},
+            {"hostid": "11"},
         ]
-        z.export_host_yaml.side_effect = lambda hid: f"zabbix_export:\n  hosts: [{hid}]\n"
+        _BATCH = (
+            "zabbix_export:\n"
+            "  hosts:\n"
+            "    - {host: srv-01, name: S1}\n"
+            "    - {host: db/primary, name: DB}\n"
+        )
+        from zabbix_template_sync.zabbix_client import ZabbixAPI as _Z
+        z.export_hosts_batched.side_effect = (
+            lambda hostids, bs: _Z.export_hosts_batched(
+                type("X", (), {"export_yaml_by_ids": staticmethod(
+                    lambda key, ids: _BATCH if ids else "")})(), hostids, bs))
         z.export_yaml_by_ids.side_effect = (
             lambda key, ids: f"zabbix_export:\n  {key}: {len(ids)}\n" if ids else "")
         z._call.side_effect = lambda m, p: (
@@ -550,6 +560,60 @@ def test_infra_ui_dags_register() -> None:
     print("  test_infra_ui_dags_register: OK")
 
 
+def test_host_batch_export_and_slicing() -> None:
+    """Хосты: батч configuration.export + нарезка на файлы (оптимизация)."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync.config_sync import ConfigSynchronizer
+    from zabbix_template_sync.zabbix_client import ZabbixAPI, _slice_hosts_export
+
+    BATCH = (
+        "zabbix_export:\n"
+        '  version: "7.4"\n'
+        '  date: "2026-06-03T10:00:00Z"\n'
+        "  host_groups:\n"
+        "    - {uuid: g1, name: Linux}\n"
+        "  hosts:\n"
+        "    - {host: srv-01, name: Сервер 01}\n"
+        "    - {host: srv-02, name: S2}\n"
+        "    - {host: db/primary, name: DB}\n"
+    )
+
+    # Нарезка: 3 хоста → 3 самодостаточных документа, date вырезан, кириллица.
+    sliced = dict(_slice_hosts_export(BATCH))
+    assert sorted(sliced) == ["db/primary", "srv-01", "srv-02"], list(sliced)
+    import yaml as _y
+    d = _y.safe_load(sliced["srv-01"])["zabbix_export"]
+    assert "date" not in d and "host_groups" in d and len(d["hosts"]) == 1
+    assert "Сервер 01" in sliced["srv-01"]
+
+    # Батчинг: 3 хоста, batch_size=2 → ровно 2 вызова configuration.export.
+    z = ZabbixAPI.__new__(ZabbixAPI)
+    calls = []
+    z.export_yaml_by_ids = lambda key, ids: (calls.append(list(ids)) or BATCH) if ids else ""
+    list(z.export_hosts_batched(["1", "2", "3"], batch_size=2))
+    assert calls == [["1", "2"], ["3"]], calls
+
+    # Интеграция в core: файлы на хост, slash в имени санитизирован.
+    def mkz():
+        zz = MagicMock(); zz.__enter__ = lambda s: zz; zz.__exit__ = lambda *a: None
+        zz.list_hosts.return_value = [{"hostid": "1"}, {"hostid": "2"}, {"hostid": "3"}]
+        zz.get_global_macros.return_value = []
+        zz._call.side_effect = lambda m, p: []
+        zz.export_yaml_by_ids.side_effect = lambda key, ids: (BATCH if key == "hosts" and ids else "")
+        zz.export_hosts_batched.side_effect = lambda hostids, bs: ZabbixAPI.export_hosts_batched(zz, hostids, bs)
+        return zz
+    gl = MagicMock(); gl.get_file_content.return_value = None
+    cap = {}
+    gl.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap.update(a=actions)
+    with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
+         patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
+        ConfigSynchronizer(_cfg(), "core").run()
+    paths = sorted(a["file_path"] for a in cap["a"])
+    assert "core/hosts/srv-01.yaml" in paths
+    assert "core/hosts/db_primary.yaml" in paths, paths
+    print("  test_host_batch_export_and_slicing: OK")
+
+
 def main() -> int:
     tests = [
         test_package_imports,
@@ -564,6 +628,7 @@ def main() -> int:
         test_config_sync_groups_and_layout,
         test_config_sync_secret_and_skip,
         test_infra_ui_groups_layout_and_secrets,
+        test_host_batch_export_and_slicing,
         test_dag_schedules,
         test_dags_register_both_branches,
         test_config_dags_register,

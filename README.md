@@ -128,7 +128,11 @@ Variables: `<env>_zabbix_auth_subdir` (default `auth`),
 | `maps/`, `dashboards/`, `scripts/` | `<имя>.yaml` поимённо | export (maps) / `*.get` |
 
 Хосты выгружаются по файлу на каждый (`core/hosts/<имя>.yaml`) через
-`configuration.export` — точный импортируемый формат. Группы и media types
+`configuration.export`. Для производительности экспорт идёт **пачками**
+(один вызов API на пачку из `host_export_batch_size` хостов, дефолт 500),
+после чего результат нарезается обратно на отдельные файлы — при 10–15 тыс.
+хостов это минуты вместо часов. Размер пачки задаётся Variable
+`<env>_host_export_batch_size`. Группы и media types
 тоже идут через `configuration.export`; roles, user groups, users, actions и
 глобальные макросы — через `*.get` + YAML.
 

@@ -21,6 +21,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+import yaml
+
 log = logging.getLogger(__name__)
 
 # Типы ресурсов в audit log Zabbix 7.x.
@@ -38,6 +40,46 @@ EXPORT_FORMAT_YAML = "yaml"
 # (значение секретного макроса/токена приходит пустым). Подставляется в
 # экспорт, чтобы при восстановлении было видно: поле есть, значение — вручную.
 SECRET_PLACEHOLDER = "[SECRET]"
+
+
+def _slice_hosts_export(batch_yaml: str):
+    """
+    Разрезает один YAML-документ configuration.export (с несколькими хостами)
+    на отдельные документы — по одному хосту в каждом.
+
+    Общие секции (host_groups, templates, template_groups, value_maps,
+    version) копируются в каждый файл, чтобы он оставался импортируемым по
+    отдельности; поле date удаляется (volatile, мешает сравнению с git).
+    Имя хоста берётся из host["host"] (техническое, уникальное).
+
+    Генератор кортежей (host_name, yaml_str). При неожиданной структуре —
+    ничего не отдаёт (вызывающий не упадёт).
+    """
+    try:
+        doc = yaml.safe_load(batch_yaml)
+    except yaml.YAMLError:
+        return
+    if not isinstance(doc, dict) or "zabbix_export" not in doc:
+        return
+
+    root = doc["zabbix_export"]
+    hosts = root.get("hosts") or []
+    if not isinstance(hosts, list):
+        return
+
+    shared = {k: v for k, v in root.items() if k not in ("hosts", "date")}
+
+    for host in hosts:
+        name = host.get("host") or host.get("name") or "host"
+        single = {"zabbix_export": {**shared, "hosts": [host]}}
+        text = yaml.safe_dump(
+            single,
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+            width=4096,
+        )
+        yield name, text
 EXPORT_FORMAT_XML = "xml"
 EXPORT_FORMAT_JSON = "json"
 
@@ -651,6 +693,39 @@ class ZabbixAPI:
     def export_host_yaml(self, hostid: str) -> str:
         """Экспортирует один хост в YAML через configuration.export."""
         return self.export_yaml_by_ids("hosts", [hostid])
+
+    def export_hosts_batched(
+        self,
+        hostids: list[str],
+        batch_size: int = 500,
+    ):
+        """
+        Быстрый экспорт множества хостов: configuration.export вызывается
+        пачками по batch_size id (один вызов на пачку), затем результат
+        нарезается обратно на отдельные хосты.
+
+        Это снимает узкое место «1 хост = 1 вызов API»: для 15000 хостов при
+        batch_size=500 будет ~30 вызовов вместо 15000.
+
+        Возвращает генератор кортежей (host_technical_name, yaml_str), где
+        yaml_str — самодостаточный документ zabbix_export с ОДНИМ хостом и
+        теми же общими секциями (version/host_groups/templates/template_groups/
+        value_maps), что отдал сервер для пачки. Общие секции сохраняются в
+        каждом файле, чтобы файл оставался импортируемым по отдельности; date
+        вырезается (volatile-поле, не нужно в git и мешает сравнению).
+
+        :param hostids: список hostid для экспорта.
+        :param batch_size: число хостов на один configuration.export.
+        """
+        if not hostids:
+            return
+        bs = max(1, int(batch_size))
+        for start in range(0, len(hostids), bs):
+            chunk = hostids[start:start + bs]
+            raw = self.export_yaml_by_ids("hosts", chunk)
+            if not raw:
+                continue
+            yield from _slice_hosts_export(raw)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Infra-объекты: прокси, прокси-группы, сетевое обнаружение, обслуживание.

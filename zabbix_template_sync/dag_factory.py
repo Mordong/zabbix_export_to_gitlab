@@ -93,6 +93,9 @@ def _build_config(env: str) -> SyncConfig:
         # DR-экспорт без правила отсрочки.
         quiet_period_sec=0,
         single_commit=_var_get(f"{env}_config_single_commit", "true").lower() == "true",
+        # Размер пачки для батч-экспорта хостов (core). Снимает узкое место
+        # при 10–15 тыс. хостов: один configuration.export на пачку.
+        host_export_batch_size=int(_var_get(f"{env}_host_export_batch_size", "500")),
         commit_author_name=f"Zabbix Sync Bot ({env})",
         commit_author_email=f"zabbix-sync-{env}@example.com",
     )

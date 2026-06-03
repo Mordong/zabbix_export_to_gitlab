@@ -2,6 +2,42 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.6.1 — оптимизация экспорта хостов (батчинг)
+
+Исправлено узкое место в `core`-экспорте: при 10–15 тыс. хостов выгрузка
+занимала часы, т.к. `configuration.export` вызывался по одному хосту
+(10–15 тыс. последовательных вызовов API).
+
+### Что изменилось
+
+- Хосты теперь экспортируются **пачками** (`configuration.export` с
+  `options:{hosts:[...]}`), затем результат **нарезается** обратно на
+  отдельные файлы. Для 15 000 хостов при batch_size=500 это ~30 вызовов
+  вместо 15 000 — выгрузка укладывается в считанные минуты.
+- Формат сохранён: по-прежнему **файл на хост** (`core/hosts/<имя>.yaml`),
+  самодостаточный и импортируемый (общие секции version/host_groups/
+  templates/value_maps копируются в каждый файл; volatile-поле `date`
+  вырезается — стабильный дифф).
+- Размер пачки настраивается: `SyncConfig.host_export_batch_size` (дефолт
+  500), Variable `<env>_host_export_batch_size`, env `HOST_EXPORT_BATCH_SIZE`,
+  yaml `host_export_batch_size`.
+
+### Изменения в коде
+
+- **`zabbix_client.py`** — `export_hosts_batched(hostids, batch_size)` +
+  module-level `_slice_hosts_export()` (парсинг батча и пересборка одиночных
+  документов на PyYAML, без новых зависимостей).
+- **`config_sync.py`** — `_build_core` использует батч-экспорт; сигнатура
+  builders унифицирована до `(zbx, folder, cfg)`.
+- **`sync.py`** — поле `host_export_batch_size` в `SyncConfig`.
+- **`dag_factory.py`**, **`cli.py`** — проброс размера пачки.
+
+### Совместимость
+
+- **Zabbix 7.4.5 / Airflow 3.1.2** — батч-`configuration.export` в форме
+  API 7.4; затронут только `core`-экспорт хостов. Templates, auth, infra/ui,
+  users/alerting не изменены. 17 smoke-тестов проходят.
+
 ## v1.6.0 — DR-экспорт infra и ui (proxies, maps, dashboards и др.)
 
 Завершён disaster-recovery набор: добавлены оставшиеся объекты конфигурации

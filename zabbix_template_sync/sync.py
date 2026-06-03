@@ -91,6 +91,11 @@ class SyncConfig:
     commit_author_name: str = "Zabbix Sync Bot"
     commit_author_email: str = "zabbix-sync@example.com"
 
+    # DR-экспорт хостов: число хостов на один configuration.export.
+    # Хосты экспортируются пачками (один вызов API на пачку) и нарезаются
+    # обратно на файлы — это снимает узкое место при 10–15 тыс. хостов.
+    host_export_batch_size: int = 500
+
 
 class TemplateSynchronizer:
     """Координатор синхронизации."""

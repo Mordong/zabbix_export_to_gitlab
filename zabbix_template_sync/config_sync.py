@@ -63,7 +63,7 @@ class ExportItem:
 @dataclass
 class ExportGroup:
     name: str
-    build_items: Callable[[ZabbixAPI, str], list[ExportItem]]
+    build_items: Callable[[ZabbixAPI, str, SyncConfig], list[ExportItem]]
 
 
 class ConfigSynchronizer:
@@ -105,7 +105,7 @@ class ConfigSynchronizer:
         with zbx:
             zbx.login(self.cfg.zabbix_user, self.cfg.zabbix_password)
             try:
-                items = group.build_items(zbx, group.name)
+                items = group.build_items(zbx, group.name, self.cfg)
             except Exception as e:  # noqa: BLE001
                 log.error("[%s] Ошибка построения списка экспорта: %s", self.group, e)
                 stats.errors.append((self.group, f"build: {e}"))
@@ -236,7 +236,7 @@ def _yaml(data_label: str, value: Any) -> str:
     return dump_yaml({data_label: value})
 
 
-def _build_users(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+def _build_users(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
     return [
         ExportItem(f"{folder}/roles.yaml", lambda: _yaml("roles", zbx.get_roles())),
         ExportItem(f"{folder}/usergroups.yaml", lambda: _yaml("usergroups", zbx.get_usergroups())),
@@ -244,7 +244,7 @@ def _build_users(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
     ]
 
 
-def _build_alerting(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+def _build_alerting(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
     def media_types() -> str:
         # configuration.export поддерживает media types целиком (без id).
         rows = zbx._call("mediatype.get", {"output": ["mediatypeid"]})
@@ -257,7 +257,7 @@ def _build_alerting(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
     ]
 
 
-def _build_core(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
     def host_groups() -> str:
         rows = zbx._call("hostgroup.get", {"output": ["groupid"]})
         return zbx.export_yaml_by_ids("host_groups", [r["groupid"] for r in rows])
@@ -273,14 +273,20 @@ def _build_core(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
     ]
 
     # Хосты — по файлу на каждый, в подпапке core/hosts/.
-    # configuration.export вызывается поимённо (точный импортируемый формат).
-    for h in zbx.list_hosts():
-        hostid = h["hostid"]
-        # Имя файла из технического host-имени (h["host"]), оно уникально.
-        fname = safe_filename(h.get("host") or hostid)
+    # ОПТИМИЗАЦИЯ: configuration.export вызывается ПАЧКАМИ по batch_size хостов
+    # (один вызов на пачку), результат нарезается обратно на отдельные хосты.
+    # Для 10–15 тыс. хостов это ~20–30 вызовов вместо 10–15 тысяч.
+    #
+    # Экспорт делается здесь (под активной сессией Zabbix) разом, а каждый
+    # ExportItem лишь отдаёт уже готовую строку — так сохраняется существующая
+    # поштучная логика сравнения/коммита (файл на хост) без повторных вызовов.
+    hostids = [h["hostid"] for h in zbx.list_hosts()]
+    batch_size = getattr(cfg, "host_export_batch_size", 500)
+    for host_name, host_yaml in zbx.export_hosts_batched(hostids, batch_size):
+        fname = safe_filename(host_name)
         items.append(ExportItem(
             f"{folder}/hosts/{fname}.yaml",
-            (lambda hid=hostid: zbx.export_host_yaml(hid)),
+            (lambda content=host_yaml: content),
         ))
     return items
 
@@ -308,7 +314,7 @@ def _named_items(rows, subdir, name_key, id_key, exporter):
     return items
 
 
-def _build_infra(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+def _build_infra(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
     """
     proxies — поимённо в proxies/; proxy groups, discovery rules, maintenance
     — одним файлом в корне. (folder не используется: раскладка «по типу».)
@@ -328,7 +334,7 @@ def _build_infra(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
     return items
 
 
-def _build_ui(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+def _build_ui(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
     """
     maps / dashboards / scripts — все поимённо, каждый в свою папку.
     maps через configuration.export, остальное через *.get.
