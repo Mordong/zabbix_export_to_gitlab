@@ -103,6 +103,9 @@ class SyncConfig:
     # Батч тяжелее одиночного экспорта, поэтому таймаут отдельный и больше
     # обычного (по аналогии с zabbix_audit_timeout_sec у auditlog).
     zabbix_export_timeout_sec: int = 300
+    # Инкрементальный экспорт хостов: ширина скользящего окна (часы). Обычный
+    # core-DAG экспортирует только хосты, изменённые за это окно (по auditlog).
+    host_incremental_window_hours: int = 24
 
 
 class TemplateSynchronizer:

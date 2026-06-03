@@ -97,6 +97,7 @@ def _build_config(env: str) -> SyncConfig:
         # при 10–15 тыс. хостов: один configuration.export на пачку.
         host_export_batch_size=int(_var_get(f"{env}_host_export_batch_size", "500")),
         zabbix_export_timeout_sec=int(_var_get(f"{env}_zabbix_export_timeout_sec", "300")),
+        host_incremental_window_hours=int(_var_get(f"{env}_host_incremental_window_hours", "24")),
         commit_chunk_size=int(_var_get(f"{env}_commit_chunk_size", "150")),
         commit_max_retries=int(_var_get(f"{env}_commit_max_retries", "3")),
         commit_author_name=f"Zabbix Sync Bot ({env})",
@@ -104,40 +105,44 @@ def _build_config(env: str) -> SyncConfig:
     )
 
 
-def _sync_task(env: str, group: str, **context) -> dict:
+def _sync_task(env: str, group: str, mode: str = "full", **context) -> dict:
     cfg = _build_config(env)
-    log.info("[%s/%s] Старт DR-экспорта Zabbix→GitLab. project=%s",
-             env.upper(), group, cfg.gitlab_project_id)
-    stats = ConfigSynchronizer(cfg, group).run()
-    log.info("[%s/%s] Итоги: %s", env.upper(), group, stats.summary())
+    log.info("[%s/%s/%s] Старт DR-экспорта Zabbix→GitLab. project=%s",
+             env.upper(), group, mode, cfg.gitlab_project_id)
+    stats = ConfigSynchronizer(cfg, group, mode=mode).run()
+    log.info("[%s/%s/%s] Итоги: %s", env.upper(), group, mode, stats.summary())
     if stats.errors:
         log.error("[%s/%s] Ошибки:\n%s", env.upper(), group,
                   "\n".join(f"  {f}: {e}" for f, e in stats.errors))
         raise RuntimeError(
             f"[{env}/{group}] завершилось с {len(stats.errors)} ошибками")
-    return {"env": env, "group": group,
+    return {"env": env, "group": group, "mode": mode,
             "created": stats.created, "updated": stats.updated,
-            "unchanged": len(stats.unchanged)}
+            "deleted": stats.deleted, "unchanged": len(stats.unchanged)}
 
 
 def build_config_dags(
     group: str,
     extra_tags: list[str] | None = None,
-    schedule: str = DR_SCHEDULE,
+    schedule: str | None = DR_SCHEDULE,
+    mode: str = "full",
+    dag_id_template: str = "zabbix_{group}_to_gitlab_{env}",
 ) -> dict:
     """
     Создаёт по DAG на среду для заданной группы и возвращает {dag_id: DAG}.
     Вызывающий регистрирует их в globals().
 
-    :param schedule: cron-расписание (по умолчанию DR_SCHEDULE = '0 21 * * *',
-        как у users/alerting/core; для infra/ui передаётся '0 19 * * *').
+    :param schedule: cron-расписание; None для ручного запуска (full-DAG).
+    :param mode: 'full' | 'incremental' — передаётся в ConfigSynchronizer.
+    :param dag_id_template: шаблон dag_id (для full-DAG отличается, чтобы не
+        конфликтовать с обычным инкрементным core-DAG).
     """
     retries = {"test": 2, "prod": 3}
     retry_delay = {"test": 5, "prod": 15}
     dags: dict = {}
 
     for env in ENVIRONMENTS:
-        dag_id = f"zabbix_{group}_to_gitlab_{env}"
+        dag_id = dag_id_template.format(group=group, env=env)
         default_args = {
             "owner": "monitoring-team",
             "depends_on_past": False,
@@ -149,20 +154,21 @@ def build_config_dags(
         }
         dag = DAG(
             dag_id=dag_id,
-            description=f"DR export of Zabbix {group} config into GitLab ({env.upper()})",
+            description=f"DR export of Zabbix {group} config into GitLab "
+                        f"({env.upper()}, {mode})",
             default_args=default_args,
             start_date=_START_DATE,
             schedule=schedule,
             catchup=False,
             max_active_runs=1,
-            tags=["zabbix", "gitlab", "monitoring", "dr", group, env]
+            tags=["zabbix", "gitlab", "monitoring", "dr", group, env, mode]
                  + (extra_tags or []),
         )
         with dag:
             PythonOperator(
                 task_id=f"sync_{group}",
                 python_callable=_sync_task,
-                op_kwargs={"env": env, "group": group},
+                op_kwargs={"env": env, "group": group, "mode": mode},
             )
         dags[dag_id] = dag
 

@@ -39,13 +39,15 @@ log = logging.getLogger(__name__)
 class ConfigSyncStats:
     created: list[str] = field(default_factory=list)
     updated: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
     unchanged: list[str] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"created={len(self.created)} updated={len(self.updated)} "
-            f"unchanged={len(self.unchanged)} errors={len(self.errors)}"
+            f"deleted={len(self.deleted)} unchanged={len(self.unchanged)} "
+            f"errors={len(self.errors)}"
         )
 
 
@@ -63,7 +65,7 @@ class ExportItem:
 @dataclass
 class ExportGroup:
     name: str
-    build_items: Callable[[ZabbixAPI, str, SyncConfig], list[ExportItem]]
+    build_items: Callable[[ZabbixAPI, str, SyncConfig, str], list[ExportItem]]
 
 
 class ConfigSynchronizer:
@@ -72,9 +74,12 @@ class ConfigSynchronizer:
     и синхронизирует соответствующий набор объектов в одноимённую папку.
     """
 
-    def __init__(self, config: SyncConfig, group: str):
+    def __init__(self, config: SyncConfig, group: str, mode: str = "full"):
         self.cfg = config
         self.group = group
+        if mode not in ("full", "incremental"):
+            raise ValueError(f"Неизвестный режим '{mode}' (full|incremental)")
+        self.mode = mode
         if group not in _GROUPS:
             raise ValueError(
                 f"Неизвестная группа экспорта '{group}'. "
@@ -105,7 +110,7 @@ class ConfigSynchronizer:
         with zbx:
             zbx.login(self.cfg.zabbix_user, self.cfg.zabbix_password)
             try:
-                items = group.build_items(zbx, group.name, self.cfg)
+                items = group.build_items(zbx, group.name, self.cfg, self.mode)
             except Exception as e:  # noqa: BLE001
                 log.error("[%s] Ошибка построения списка экспорта: %s", self.group, e)
                 stats.errors.append((self.group, f"build: {e}"))
@@ -114,8 +119,41 @@ class ConfigSynchronizer:
             for item in items:
                 self._process_item(gl, item, stats, actions)
 
+            # Чистка осиротевших файлов — только в full-режиме для core:
+            # сравниваем актуальный набор хост-файлов с тем, что лежит в
+            # репозитории, и удаляем лишние (в т.ч. старые имена без hostid).
+            if self.mode == "full" and self.group == "core":
+                self._cleanup_orphans(gl, items, actions, stats)
+
         self._apply_actions(gl, actions, stats)
         return stats
+
+    def _cleanup_orphans(
+        self,
+        gl: GitLabClient,
+        items: list[ExportItem],
+        actions: list[dict[str, Any]],
+        stats: ConfigSyncStats,
+    ) -> None:
+        """
+        Добавляет действия delete для файлов в core/hosts/, которых нет в
+        текущем наборе экспорта. Выполняется только при полном экспорте,
+        иначе (инкремент видит лишь подмножество) можно удалить живые хосты.
+        """
+        expected = {it.file_path for it in items if it.file_path.startswith("core/hosts/")}
+        try:
+            existing = set(gl.list_files("core/hosts"))
+        except Exception as e:  # noqa: BLE001
+            log.error("Не удалось получить список core/hosts для чистки: %s", e)
+            stats.errors.append(("core/hosts", f"list: {e}"))
+            return
+        orphans = existing - expected
+        for path in sorted(orphans):
+            log.info("[DELETE] %s (осиротевший)", path)
+            actions.append({"action": "delete", "file_path": path,
+                            "content": None, "_kind": "deleted"})
+        if orphans:
+            log.info("[core] К удалению осиротевших файлов: %d", len(orphans))
 
     # ──────────────────────────────────────────────────────────────────────────
     def _process_item(
@@ -175,7 +213,13 @@ class ConfigSynchronizer:
             return
 
         for a in actions:
-            (stats.created if a["_kind"] == "created" else stats.updated).append(a["file_path"])
+            kind = a["_kind"]
+            if kind == "created":
+                stats.created.append(a["file_path"])
+            elif kind == "updated":
+                stats.updated.append(a["file_path"])
+            elif kind == "deleted":
+                stats.deleted.append(a["file_path"])
 
         if self.cfg.single_commit:
             msg = self._commit_message(actions)
@@ -195,6 +239,7 @@ class ConfigSynchronizer:
                 stats.errors.extend((p, reason) for p, reason in failed)
                 stats.created[:] = [p for p in stats.created if p not in failed_set]
                 stats.updated[:] = [p for p in stats.updated if p not in failed_set]
+                stats.deleted[:] = [p for p in stats.deleted if p not in failed_set]
                 log.error("[%s] Не закоммичено файлов: %d", self.group, len(failed_set))
         else:
             for a in actions:
@@ -240,7 +285,7 @@ def _yaml(data_label: str, value: Any) -> str:
     return dump_yaml({data_label: value})
 
 
-def _build_users(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
+def _build_users(zbx: ZabbixAPI, folder: str, cfg: SyncConfig, mode: str) -> list[ExportItem]:
     return [
         ExportItem(f"{folder}/roles.yaml", lambda: _yaml("roles", zbx.get_roles())),
         ExportItem(f"{folder}/usergroups.yaml", lambda: _yaml("usergroups", zbx.get_usergroups())),
@@ -248,7 +293,7 @@ def _build_users(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportIte
     ]
 
 
-def _build_alerting(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
+def _build_alerting(zbx: ZabbixAPI, folder: str, cfg: SyncConfig, mode: str) -> list[ExportItem]:
     def media_types() -> str:
         # configuration.export поддерживает media types целиком (без id).
         rows = zbx._call("mediatype.get", {"output": ["mediatypeid"]})
@@ -261,7 +306,7 @@ def _build_alerting(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[Export
     ]
 
 
-def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
+def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig, mode: str) -> list[ExportItem]:
     def host_groups() -> str:
         rows = zbx._call("hostgroup.get", {"output": ["groupid"]})
         return zbx.export_yaml_by_ids("host_groups", [r["groupid"] for r in rows])
@@ -270,6 +315,8 @@ def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem
         rows = zbx._call("templategroup.get", {"output": ["groupid"]})
         return zbx.export_yaml_by_ids("template_groups", [r["groupid"] for r in rows])
 
+    # Группы и макросы — маленькие, экспортируем всегда (и в инкременте):
+    # они идемпотентны и почти не нагружают.
     items = [
         ExportItem(f"{folder}/hostgroups.yaml", host_groups),
         ExportItem(f"{folder}/templategroups.yaml", template_groups),
@@ -277,22 +324,33 @@ def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem
     ]
 
     # Хосты — по файлу на каждый, в подпапке core/hosts/.
-    # ОПТИМИЗАЦИЯ: configuration.export вызывается ПАЧКАМИ по batch_size хостов
-    # (один вызов на пачку), результат нарезается обратно на отдельные хосты.
-    # Для 10–15 тыс. хостов это ~20–30 вызовов вместо 10–15 тысяч.
-    #
-    # Экспорт делается здесь (под активной сессией Zabbix) разом, а каждый
-    # ExportItem лишь отдаёт уже готовую строку — так сохраняется существующая
-    # поштучная логика сравнения/коммита (файл на хост) без повторных вызовов.
-    hostids = [h["hostid"] for h in zbx.list_hosts()]
+    # full        — все хосты (батч-экспорт, нарезка);
+    # incremental — только изменённые за окно (через auditlog).
+    all_hostids = [h["hostid"] for h in zbx.list_hosts()]
+
+    if mode == "incremental":
+        window_h = getattr(cfg, "host_incremental_window_hours", 24)
+        changed, audit_ok = zbx.get_changed_hostids(
+            window_sec=int(window_h) * 3600,
+            audit_timeout=getattr(cfg, "zabbix_audit_timeout_sec", 60),
+        )
+        if not audit_ok:
+            # Потеря сигнала: не делаем тихо «нет изменений». Логируем и
+            # пропускаем хосты в этом прогоне (полный снимок даёт full-DAG).
+            log.warning(
+                "[core] auditlog недоступен — хосты в инкременте пропущены, "
+                "запустите full-экспорт для полного снимка.")
+            return items
+        hostids = [hid for hid in all_hostids if hid in changed]
+        log.info("[core] Инкремент: изменённых хостов за окно — %d из %d.",
+                 len(hostids), len(all_hostids))
+    else:
+        hostids = all_hostids
+
     batch_size = getattr(cfg, "host_export_batch_size", 500)
     export_timeout = getattr(cfg, "zabbix_export_timeout_sec", None)
     for host_name, hostid, host_yaml in zbx.export_hosts_batched(
             hostids, batch_size, export_timeout=export_timeout):
-        # Имя файла = <безопасное_имя>_<hostid>.yaml. hostid гарантирует
-        # уникальность: технические имена хостов в Zabbix могут схлопываться
-        # в одно имя файла после очистки спецсимволов (например, "X" и "X-"),
-        # из-за чего возникали два действия на один путь и коммит падал.
         base = safe_filename(host_name)
         fname = f"{base}_{hostid}" if hostid else base
         items.append(ExportItem(
@@ -325,7 +383,7 @@ def _named_items(rows, subdir, name_key, id_key, exporter):
     return items
 
 
-def _build_infra(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
+def _build_infra(zbx: ZabbixAPI, folder: str, cfg: SyncConfig, mode: str) -> list[ExportItem]:
     """
     proxies — поимённо в proxies/; proxy groups, discovery rules, maintenance
     — одним файлом в корне. (folder не используется: раскладка «по типу».)
@@ -345,7 +403,7 @@ def _build_infra(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportIte
     return items
 
 
-def _build_ui(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem]:
+def _build_ui(zbx: ZabbixAPI, folder: str, cfg: SyncConfig, mode: str) -> list[ExportItem]:
     """
     maps / dashboards / scripts — все поимённо, каждый в свою папку.
     maps через configuration.export, остальное через *.get.

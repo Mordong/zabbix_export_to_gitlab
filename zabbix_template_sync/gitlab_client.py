@@ -285,6 +285,44 @@ class GitLabClient:
             json_body=body,
         )
 
+    def list_files(self, path: str) -> list[str]:
+        """
+        Возвращает список путей файлов (blobs) внутри указанной папки
+        репозитория, рекурсивно. Используется для вычисления осиротевших
+        файлов при полном экспорте (что есть в git, но больше не
+        экспортируется).
+
+        Пагинация через /repository/tree (per_page=100, page=N) до пустой
+        страницы. Возвращаются только файлы (type=='blob'), не директории.
+        """
+        out: list[str] = []
+        page = 1
+        while True:
+            rows = self._request(
+                "GET",
+                f"/projects/{self.project_id}/repository/tree",
+                params={
+                    "path": path,
+                    "ref": self.branch,
+                    "recursive": "true",
+                    "per_page": "100",
+                    "page": str(page),
+                },
+                ok_404=True,
+            )
+            if not rows:
+                break
+            for r in rows:
+                if r.get("type") == "blob" and r.get("path"):
+                    out.append(r["path"])
+            if len(rows) < 100:
+                break
+            page += 1
+            if page > 1000:  # предохранитель от бесконечного цикла
+                log.warning("list_files(%s): прервано на 1000 страницах", path)
+                break
+        return out
+
     def commit_multiple(
         self,
         actions: list[dict[str, Any]],

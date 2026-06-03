@@ -686,6 +686,85 @@ def test_host_filename_collision_resolved_by_hostid() -> None:
     print("  test_host_filename_collision_resolved_by_hostid: OK")
 
 
+def test_host_incremental_and_full_cleanup() -> None:
+    """core: инкремент фильтрует по auditlog; full удаляет осиротевшие."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync.config_sync import ConfigSynchronizer
+    from zabbix_template_sync.zabbix_client import ZabbixAPI
+
+    BATCH = "zabbix_export:\n  hosts:\n    - {host: srv-01}\n    - {host: srv-02}\n"
+
+    def mkz(changed=None, audit_ok=True):
+        z = MagicMock(); z.__enter__ = lambda s: z; z.__exit__ = lambda *a: None
+        z.list_hosts.return_value = [
+            {"hostid": "1", "host": "srv-01"}, {"hostid": "2", "host": "srv-02"}]
+        z.get_global_macros.return_value = []
+        z._call.side_effect = lambda m, p: []
+        z.export_yaml_by_ids.side_effect = (
+            lambda key, ids, timeout_override=None: (BATCH if key == "hosts" and ids else ""))
+        z.export_hosts_batched.side_effect = (
+            lambda hostids, bs, export_timeout=None: ZabbixAPI.export_hosts_batched(
+                z, hostids, bs, export_timeout=export_timeout))
+        z.get_changed_hostids.return_value = (changed if changed is not None else set(), audit_ok)
+        return z
+
+    # incremental: изменён hostid=1 → запрашиваются только изменённые
+    gl = MagicMock(); gl.get_file_content.return_value = None
+    cap = {}
+    gl.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap.update(a=actions)
+    zz = mkz(changed={"1"})
+    with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
+         patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=zz):
+        ConfigSynchronizer(_cfg(), "core", mode="incremental").run()
+    # export_hosts_batched получил только изменённый hostid
+    called_ids = zz.export_hosts_batched.call_args[0][0]
+    assert called_ids == ["1"], called_ids
+
+    # incremental + audit недоступен → хосты не экспортируются
+    gl2 = MagicMock(); gl2.get_file_content.return_value = None
+    cap2 = {}
+    gl2.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap2.update(a=actions)
+    with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl2), \
+         patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz(audit_ok=False)):
+        ConfigSynchronizer(_cfg(), "core", mode="incremental").run()
+    host_files = [a["file_path"] for a in cap2.get("a", []) if "hosts/" in a["file_path"]]
+    assert host_files == [], host_files
+
+    # full + cleanup: лишний файл в репо → delete
+    gl3 = MagicMock(); gl3.get_file_content.return_value = None
+    gl3.list_files.return_value = [
+        "core/hosts/srv-01_1.yaml", "core/hosts/srv-02_2.yaml", "core/hosts/OLD.yaml"]
+    cap3 = {}
+    gl3.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap3.update(a=actions)
+    with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl3), \
+         patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
+        s = ConfigSynchronizer(_cfg(), "core", mode="full").run()
+    deletes = [a["file_path"] for a in cap3["a"] if a["action"] == "delete"]
+    assert deletes == ["core/hosts/OLD.yaml"], deletes
+    assert "core/hosts/OLD.yaml" in s.deleted
+    print("  test_host_incremental_and_full_cleanup: OK")
+
+
+def test_core_full_dag_registers() -> None:
+    """Ручной full-DAG регистрируется в обеих ветках Airflow, schedule=None."""
+    import importlib.util
+    for use_sdk in (True, False):
+        _build_fake_airflow(use_sdk)
+        for m in list(sys.modules):
+            if "to_gitlab" in m or "dag_factory" in m:
+                del sys.modules[m]
+        path = os.path.join(ROOT, "dags", "zabbix_core_full_to_gitlab.py")
+        spec = importlib.util.spec_from_file_location("zabbix_core_full_to_gitlab", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ids = sorted(k for k in vars(mod) if k.startswith("zabbix_core_full_to_gitlab_"))
+        assert ids == ["zabbix_core_full_to_gitlab_prod", "zabbix_core_full_to_gitlab_test"], ids
+        for did in ids:
+            assert getattr(mod, did).kw["schedule"] is None
+            assert "full" in getattr(mod, did).kw["tags"]
+    print("  test_core_full_dag_registers: OK")
+
+
 def main() -> int:
     tests = [
         test_package_imports,
@@ -703,10 +782,12 @@ def main() -> int:
         test_host_batch_export_and_slicing,
         test_host_filename_collision_resolved_by_hostid,
         test_chunked_commit_failure_handling,
+        test_host_incremental_and_full_cleanup,
         test_dag_schedules,
         test_dags_register_both_branches,
         test_config_dags_register,
         test_infra_ui_dags_register,
+        test_core_full_dag_registers,
     ]
     print(f"Running {len(tests)} smoke tests…")
     for t in tests:

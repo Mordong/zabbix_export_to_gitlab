@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -32,6 +33,9 @@ log = logging.getLogger(__name__)
 AUDIT_RESOURCE_TEMPLATE = 30
 AUDIT_RESOURCE_AUTHENTICATION = 42
 AUDIT_RESOURCE_USERDIRECTORY = 49
+# resourcetype для HOST в audit log Zabbix 7.x. По документации API host=4.
+# Вынесен в константу и параметризуется на случай отличий в конкретной версии.
+AUDIT_RESOURCE_HOST = 4
 
 # Поддерживаемые форматы экспорта в Zabbix 7.x
 EXPORT_FORMAT_YAML = "yaml"
@@ -761,6 +765,61 @@ class ZabbixAPI:
             if not raw:
                 continue
             yield from _slice_hosts_export(raw, name_to_id)
+
+    def get_changed_hostids(
+        self,
+        window_sec: int,
+        now: int | None = None,
+        resourcetype: int = AUDIT_RESOURCE_HOST,
+        audit_timeout: int = 60,
+        limit: int = 50000,
+    ) -> tuple[set[str], bool]:
+        """
+        Возвращает (hostids, audit_ok) — множество hostid, изменённых за
+        последнее окно window_sec секунд, по данным auditlog.get.
+
+        Различаем два случая, важных для disaster recovery:
+          - audit_ok=True  — запрос прошёл. Пустое множество означает «за окно
+            правок не было» (нормальный исход; инкремент ничего не коммитит).
+          - audit_ok=False — auditlog.get недоступен/ошибка (нет прав, таймаут,
+            метод отключён). Это НЕ «нет изменений», а потеря сигнала: пустое
+            множество тут недостоверно. Вызывающий должен залогировать
+            предупреждение и положиться на полный экспорт, а не считать, что
+            менять нечего.
+
+        :param window_sec: ширина скользящего окна (сек).
+        :param now: точка «сейчас» (unix); по умолчанию time.time().
+        :param resourcetype: код ресурса host в audit log (7.x: 4).
+        :param audit_timeout: таймаут запроса (auditlog тяжёлый).
+        :param limit: верхняя граница числа записей.
+        """
+        ts_now = int(now if now is not None else time.time())
+        since = ts_now - int(window_sec)
+        try:
+            records = self._call(
+                "auditlog.get",
+                {
+                    "output": ["resourceid", "clock"],
+                    "filter": {"resourcetype": resourcetype},
+                    "time_from": since,
+                    "sortfield": "clock",
+                    "sortorder": "DESC",
+                    "limit": int(limit),
+                },
+                timeout_override=int(audit_timeout),
+            )
+        except ZabbixAPIError as e:
+            log.warning(
+                "auditlog.get для хостов недоступен: %s. "
+                "Инкремент недостоверен — полагайтесь на full-экспорт.", e)
+            return set(), False
+
+        hostids: set[str] = set()
+        for rec in records:
+            rid = str(rec.get("resourceid", ""))
+            if rid:
+                hostids.add(rid)
+        return hostids, True
 
     # ──────────────────────────────────────────────────────────────────────────
     # Infra-объекты: прокси, прокси-группы, сетевое обнаружение, обслуживание.

@@ -57,6 +57,7 @@ def _config_from_env() -> SyncConfig:
         single_commit=env("SINGLE_COMMIT", "true").lower() == "true",
         host_export_batch_size=int(env("HOST_EXPORT_BATCH_SIZE", "500")),
         zabbix_export_timeout_sec=int(env("ZABBIX_EXPORT_TIMEOUT_SEC", "300")),
+        host_incremental_window_hours=int(env("HOST_INCREMENTAL_WINDOW_HOURS", "24")),
         commit_chunk_size=int(env("COMMIT_CHUNK_SIZE", "150")),
         commit_max_retries=int(env("COMMIT_MAX_RETRIES", "3")),
     )
@@ -93,6 +94,7 @@ def _config_from_yaml(path: str) -> SyncConfig:
         single_commit=bool(s.get("single_commit", True)),
         host_export_batch_size=int(s.get("host_export_batch_size", 500)),
         zabbix_export_timeout_sec=int(s.get("zabbix_export_timeout_sec", 300)),
+        host_incremental_window_hours=int(s.get("host_incremental_window_hours", 24)),
         commit_chunk_size=int(s.get("commit_chunk_size", 150)),
         commit_max_retries=int(s.get("commit_max_retries", 3)),
         commit_author_name=s.get("commit_author_name", "Zabbix Sync Bot"),
