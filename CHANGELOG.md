@@ -2,6 +2,50 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.6.0 — DR-экспорт infra и ui (proxies, maps, dashboards и др.)
+
+Завершён disaster-recovery набор: добавлены оставшиеся объекты конфигурации
+двумя новыми группами/DAG. Запуск раз в сутки в 19:00, без quiet period.
+
+### Что нового
+
+- **infra** (DAG `zabbix_infra_to_gitlab_<env>`):
+  - `proxies/<имя>.yaml` — прокси поимённо (TLS PSK маскируется `[SECRET]`);
+  - `proxygroups.yaml`, `drules.yaml` (сетевое обнаружение), `maintenance.yaml`
+    — одним файлом в корне.
+- **ui** (DAG `zabbix_ui_to_gitlab_<env>`):
+  - `maps/<имя>.yaml` — карты поимённо (configuration.export);
+  - `dashboards/<имя>.yaml` — дашборды поимённо;
+  - `scripts/<имя>.yaml` — скрипты поимённо (password маскируется `[SECRET]`).
+- Оба DAG: расписание `0 19 * * *`, без quiet period.
+
+### Метод и секреты
+
+- maps — `configuration.export`; остальное — `*.get` + `dump_yaml`.
+- proxy groups (`proxygroup.get`, Zabbix 7.0+) — с мягким fallback на пустой
+  список, если метод недоступен по версии/правам.
+- Секреты: proxy TLS PSK и script password, где приходят непустыми,
+  заменяются на `[SECRET]`.
+
+### Изменения в коде
+
+- **`zabbix_client.py`** — `get_proxies`/`list_proxies_brief`/`get_proxy`
+  (маскировка PSK), `get_proxy_groups` (fallback), `get_discovery_rules`,
+  `get_maintenances`, `list_maps`/`export_map_yaml`,
+  `list_dashboards`/`get_dashboard`, `list_scripts`/`get_script` (маскировка
+  пароля).
+- **`config_sync.py`** — группы `infra` и `ui` + хелпер `_named_items`
+  (поимённый экспорт в свою папку).
+- **`dag_factory.py`** — параметр `schedule` (дефолт `0 21 * * *` сохранён).
+- **`dags/zabbix_{infra,ui}_to_gitlab.py`** (новые) — обёртки с `0 19 * * *`.
+
+### Совместимость
+
+- **Zabbix 7.4.5 / Airflow 3.1.2** — методы в форме API 7.4; новые DAG по тем
+  же паттернам Airflow 3 (проверено: регистрация 4 новых DAG в ветках импорта
+  SDK и legacy). 16 smoke-тестов проходят.
+- Обратно-совместимо: предыдущие экспорты не затронуты.
+
 ## v1.5.0 — disaster-recovery экспорт конфигурации (users / alerting / core)
 
 Добавлен экспорт минимального набора объектов для восстановления Zabbix «с

@@ -481,6 +481,75 @@ def test_config_dags_register() -> None:
     print("  test_config_dags_register: OK")
 
 
+def test_infra_ui_groups_layout_and_secrets() -> None:
+    """infra/ui: раскладка (поимённо в свою папку + мелкие в корне) + маскировка."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync.config_sync import ConfigSynchronizer
+    from zabbix_template_sync.zabbix_client import ZabbixAPI, SECRET_PLACEHOLDER
+
+    def mkz():
+        z = MagicMock(); z.__enter__ = lambda s: z; z.__exit__ = lambda *a: None
+        z.list_proxies_brief.return_value = [
+            {"proxyid": "1", "name": "proxy-msk"}, {"proxyid": "2", "name": "proxy/spb"}]
+        z.get_proxy.side_effect = lambda pid: {"proxyid": pid, "name": "p" + pid}
+        z.get_proxy_groups.return_value = [{"proxy_groupid": "9", "name": "PG1"}]
+        z.get_discovery_rules.return_value = [{"druleid": "3", "name": "Net"}]
+        z.get_maintenances.return_value = [{"maintenanceid": "4", "name": "Weekly"}]
+        z.list_maps.return_value = [{"sysmapid": "5", "name": "DC map"}]
+        z.export_map_yaml.side_effect = lambda sid: f"zabbix_export:\n  maps: [{sid}]\n"
+        z.list_dashboards.return_value = [{"dashboardid": "6", "name": "Overview"}]
+        z.get_dashboard.side_effect = lambda did: {"dashboardid": did, "name": "D"}
+        z.list_scripts.return_value = [{"scriptid": "7", "name": "Reboot"}]
+        z.get_script.side_effect = lambda scid: {"scriptid": scid, "name": "S"}
+        return z
+
+    expect = {
+        "infra": ["proxies/proxy-msk.yaml", "proxies/proxy_spb.yaml",
+                  "proxygroups.yaml", "drules.yaml", "maintenance.yaml"],
+        "ui": ["maps/DC_map.yaml", "dashboards/Overview.yaml", "scripts/Reboot.yaml"],
+    }
+    for grp, files in expect.items():
+        gl = MagicMock(); gl.get_file_content.return_value = None
+        cap = {}
+        gl.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap.update(a=actions)
+        with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
+             patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
+            ConfigSynchronizer(_cfg(), grp).run()
+        paths = sorted(a["file_path"] for a in cap["a"])
+        for f in files:
+            assert f in paths, (grp, f, paths)
+
+    # Маскировка: proxy TLS PSK и script password (юнит-проверка методов клиента)
+    z = ZabbixAPI.__new__(ZabbixAPI)
+    z._call = MagicMock(return_value=[{"proxyid": "1", "name": "p",
+                                       "tls_psk": "abcd", "tls_psk_identity": "id"}])
+    assert z.get_proxy("1")["tls_psk"] == SECRET_PLACEHOLDER
+    z2 = ZabbixAPI.__new__(ZabbixAPI)
+    z2._call = MagicMock(return_value=[{"scriptid": "7", "name": "r", "password": "x"}])
+    assert z2.get_script("7")["password"] == SECRET_PLACEHOLDER
+    print("  test_infra_ui_groups_layout_and_secrets: OK")
+
+
+def test_infra_ui_dags_register() -> None:
+    """infra/ui DAG регистрируются в обеих ветках Airflow, schedule 0 19 * * *."""
+    import importlib.util
+    for use_sdk in (True, False):
+        _build_fake_airflow(use_sdk)
+        for m in list(sys.modules):
+            if "to_gitlab" in m or "dag_factory" in m:
+                del sys.modules[m]
+        for g in ("infra", "ui"):
+            path = os.path.join(ROOT, "dags", f"zabbix_{g}_to_gitlab.py")
+            spec = importlib.util.spec_from_file_location(f"zabbix_{g}_to_gitlab", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            ids = sorted(k for k in vars(mod) if k.startswith(f"zabbix_{g}_to_gitlab_"))
+            assert ids == [f"zabbix_{g}_to_gitlab_prod", f"zabbix_{g}_to_gitlab_test"], (g, ids)
+            for did in ids:
+                assert getattr(mod, did).kw["schedule"] == "0 19 * * *"
+    print("  test_infra_ui_dags_register: OK")
+
+
 def main() -> int:
     tests = [
         test_package_imports,
@@ -494,9 +563,11 @@ def main() -> int:
         test_auth_creates_csv_per_directory,
         test_config_sync_groups_and_layout,
         test_config_sync_secret_and_skip,
+        test_infra_ui_groups_layout_and_secrets,
         test_dag_schedules,
         test_dags_register_both_branches,
         test_config_dags_register,
+        test_infra_ui_dags_register,
     ]
     print(f"Running {len(tests)} smoke tests…")
     for t in tests:

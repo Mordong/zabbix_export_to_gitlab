@@ -124,6 +124,8 @@ Variables: `<env>_zabbix_auth_subdir` (default `auth`),
 | `users/` | `roles.yaml`, `usergroups.yaml`, `users.yaml` | `*.get` |
 | `alerting/` | `mediatypes.yaml`, `actions.yaml` | export / `*.get` |
 | `core/` | `hostgroups.yaml`, `templategroups.yaml`, `macros.yaml`, `hosts/<имя>.yaml` | configuration.export / `*.get` |
+| `proxies/`, корень | `proxies/<имя>.yaml`, `proxygroups.yaml`, `drules.yaml`, `maintenance.yaml` | `*.get` |
+| `maps/`, `dashboards/`, `scripts/` | `<имя>.yaml` поимённо | export (maps) / `*.get` |
 
 Хосты выгружаются по файлу на каждый (`core/hosts/<имя>.yaml`) через
 `configuration.export` — точный импортируемый формат. Группы и media types
@@ -131,9 +133,10 @@ Variables: `<env>_zabbix_auth_subdir` (default `auth`),
 глобальные макросы — через `*.get` + YAML.
 
 DAG (`zabbix_users_to_gitlab_<env>` и аналоги для alerting/core) запускаются
-**раз в сутки в 21:00** (`0 21 * * *`) **без правила отсрочки** — эти объекты
-меняются редко, любое расхождение коммитится сразу. Переиспользуются те же
-Connections и `<env>_gitlab_project_id`.
+**раз в сутки в 21:00** (`0 21 * * *`), а `zabbix_infra_to_gitlab_<env>` и
+`zabbix_ui_to_gitlab_<env>` — **в 19:00** (`0 19 * * *`), все **без правила
+отсрочки** — эти объекты меняются редко, любое расхождение коммитится сразу.
+Переиспользуются те же Connections и `<env>_gitlab_project_id`.
 
 **Секреты не экспортируются** (Zabbix API их не отдаёт):
 - секретные макросы (type=Secret) помечаются маркером `[SECRET]`;
@@ -146,7 +149,9 @@ Connections и `<env>_gitlab_project_id`.
 
 Учётке Zabbix нужны права на `role.get`, `usergroup.get`, `user.get`,
 `mediatype.get`, `action.get`, `usermacro.get`, `hostgroup.get`,
-`templategroup.get`, `host.get` и `configuration.export` — роль Super admin.
+`templategroup.get`, `host.get`, `proxy.get`, `proxygroup.get`, `drule.get`,
+`maintenance.get`, `map.get`, `dashboard.get`, `script.get` и
+`configuration.export` — роль Super admin.
 
 ## Поддержка кириллицы
 

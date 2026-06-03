@@ -290,3 +290,64 @@ _GROUPS: dict[str, ExportGroup] = {
     "alerting": ExportGroup("alerting", _build_alerting),
     "core": ExportGroup("core", _build_core),
 }
+
+
+def _named_items(rows, subdir, name_key, id_key, exporter):
+    """
+    Хелпер для «крупных поимённо»: по файлу на объект в своей папке
+    (<subdir>/<имя>.yaml). exporter(obj_id) -> YAML-строка.
+    """
+    items = []
+    for r in rows:
+        oid = r[id_key]
+        fname = safe_filename(r.get(name_key) or oid)
+        items.append(ExportItem(
+            f"{subdir}/{fname}.yaml",
+            (lambda _id=oid: exporter(_id)),
+        ))
+    return items
+
+
+def _build_infra(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+    """
+    proxies — поимённо в proxies/; proxy groups, discovery rules, maintenance
+    — одним файлом в корне. (folder не используется: раскладка «по типу».)
+    """
+    items: list[ExportItem] = []
+    # proxies поимённо (через proxy.get — у каждого свой файл)
+    items += _named_items(
+        zbx.list_proxies_brief(), "proxies", "name", "proxyid",
+        lambda pid: _yaml("proxy", zbx.get_proxy(pid)),
+    )
+    # мелкие — одним файлом в корне
+    items += [
+        ExportItem("proxygroups.yaml", lambda: _yaml("proxy_groups", zbx.get_proxy_groups())),
+        ExportItem("drules.yaml", lambda: _yaml("discovery_rules", zbx.get_discovery_rules())),
+        ExportItem("maintenance.yaml", lambda: _yaml("maintenance", zbx.get_maintenances())),
+    ]
+    return items
+
+
+def _build_ui(zbx: ZabbixAPI, folder: str) -> list[ExportItem]:
+    """
+    maps / dashboards / scripts — все поимённо, каждый в свою папку.
+    maps через configuration.export, остальное через *.get.
+    """
+    items: list[ExportItem] = []
+    items += _named_items(
+        zbx.list_maps(), "maps", "name", "sysmapid",
+        lambda sid: zbx.export_map_yaml(sid),
+    )
+    items += _named_items(
+        zbx.list_dashboards(), "dashboards", "name", "dashboardid",
+        lambda did: _yaml("dashboard", zbx.get_dashboard(did)),
+    )
+    items += _named_items(
+        zbx.list_scripts(), "scripts", "name", "scriptid",
+        lambda scid: _yaml("script", zbx.get_script(scid)),
+    )
+    return items
+
+
+_GROUPS["infra"] = ExportGroup("infra", _build_infra)
+_GROUPS["ui"] = ExportGroup("ui", _build_ui)

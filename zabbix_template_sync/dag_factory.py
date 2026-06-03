@@ -114,10 +114,17 @@ def _sync_task(env: str, group: str, **context) -> dict:
             "unchanged": len(stats.unchanged)}
 
 
-def build_config_dags(group: str, extra_tags: list[str] | None = None) -> dict:
+def build_config_dags(
+    group: str,
+    extra_tags: list[str] | None = None,
+    schedule: str = DR_SCHEDULE,
+) -> dict:
     """
-    Создаёт по DAG на среду для заданной группы ('users'/'alerting'/'core')
-    и возвращает {dag_id: DAG}. Вызывающий регистрирует их в globals().
+    Создаёт по DAG на среду для заданной группы и возвращает {dag_id: DAG}.
+    Вызывающий регистрирует их в globals().
+
+    :param schedule: cron-расписание (по умолчанию DR_SCHEDULE = '0 21 * * *',
+        как у users/alerting/core; для infra/ui передаётся '0 19 * * *').
     """
     retries = {"test": 2, "prod": 3}
     retry_delay = {"test": 5, "prod": 15}
@@ -139,7 +146,7 @@ def build_config_dags(group: str, extra_tags: list[str] | None = None) -> dict:
             description=f"DR export of Zabbix {group} config into GitLab ({env.upper()})",
             default_args=default_args,
             start_date=_START_DATE,
-            schedule=DR_SCHEDULE,
+            schedule=schedule,
             catchup=False,
             max_active_runs=1,
             tags=["zabbix", "gitlab", "monitoring", "dr", group, env]

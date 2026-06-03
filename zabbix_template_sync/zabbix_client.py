@@ -651,3 +651,109 @@ class ZabbixAPI:
     def export_host_yaml(self, hostid: str) -> str:
         """Экспортирует один хост в YAML через configuration.export."""
         return self.export_yaml_by_ids("hosts", [hostid])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Infra-объекты: прокси, прокси-группы, сетевое обнаружение, обслуживание.
+    # ──────────────────────────────────────────────────────────────────────────
+    def get_proxies(self) -> list[dict[str, Any]]:
+        """
+        Прокси (proxy.get). TLS-секреты (tls_psk, tls_psk_identity) Zabbix API
+        отдаёт только при наличии прав; где они приходят непустыми — маскируем
+        в SECRET_PLACEHOLDER, чтобы PSK не утекал в git.
+        """
+        proxies = self._call("proxy.get", {"output": "extend"})
+        return [self._mask_proxy_secrets(p) for p in proxies]
+
+    @staticmethod
+    def _mask_proxy_secrets(p: dict[str, Any]) -> dict[str, Any]:
+        for secret_field in ("tls_psk", "tls_psk_identity"):
+            if p.get(secret_field):
+                p[secret_field] = SECRET_PLACEHOLDER
+        return p
+
+    def list_proxies_brief(self) -> list[dict[str, Any]]:
+        """Лёгкий список прокси (proxyid + name) для поимённого экспорта."""
+        return self._call("proxy.get", {"output": ["proxyid", "name"]})
+
+    def get_proxy(self, proxyid: str) -> dict[str, Any]:
+        """Один прокси (proxy.get) с маскировкой TLS-секретов."""
+        rows = self._call("proxy.get", {"output": "extend", "proxyids": [proxyid]})
+        return self._mask_proxy_secrets(rows[0]) if rows else {}
+
+    def get_proxy_groups(self) -> list[dict[str, Any]]:
+        """
+        Прокси-группы (proxygroup.get, Zabbix 7.0+). На версиях/правах, где
+        метод недоступен, — мягкий fallback на пустой список.
+        """
+        try:
+            return self._call("proxygroup.get", {"output": "extend"})
+        except ZabbixAPIError as e:
+            log.warning(
+                "proxygroup.get недоступен (%s) — пропускаю прокси-группы.", e)
+            return []
+
+    def get_discovery_rules(self) -> list[dict[str, Any]]:
+        """Правила сетевого обнаружения (drule.get) с проверками (dchecks)."""
+        return self._call("drule.get", {
+            "output": "extend",
+            "selectDChecks": "extend",
+        })
+
+    def get_maintenances(self) -> list[dict[str, Any]]:
+        """Окна обслуживания (maintenance.get) с таймпериодами и группами."""
+        return self._call("maintenance.get", {
+            "output": "extend",
+            "selectTimeperiods": "extend",
+            "selectHostGroups": ["groupid", "name"],
+            "selectHosts": ["hostid", "host"],
+            "selectTags": "extend",
+        })
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # UI-объекты: карты, дашборды, скрипты.
+    # ──────────────────────────────────────────────────────────────────────────
+    def list_maps(self) -> list[dict[str, Any]]:
+        """Лёгкий список карт (sysmapid + name) для поимённого экспорта."""
+        return self._call("map.get", {"output": ["sysmapid", "name"]})
+
+    def export_map_yaml(self, sysmapid: str) -> str:
+        """Экспортирует одну карту в YAML через configuration.export."""
+        return self.export_yaml_by_ids("maps", [sysmapid])
+
+    def list_dashboards(self) -> list[dict[str, Any]]:
+        """Лёгкий список дашбордов (dashboardid + name)."""
+        return self._call("dashboard.get", {"output": ["dashboardid", "name"]})
+
+    def get_dashboard(self, dashboardid: str) -> dict[str, Any]:
+        """
+        Один дашборд (dashboard.get) с виджетами, страницами и пользователями.
+        Возвращает dict (или {} если не найден).
+        """
+        rows = self._call("dashboard.get", {
+            "output": "extend",
+            "dashboardids": [dashboardid],
+            "selectPages": "extend",
+            "selectUsers": "extend",
+            "selectUserGroups": "extend",
+        })
+        return rows[0] if rows else {}
+
+    def list_scripts(self) -> list[dict[str, Any]]:
+        """Лёгкий список скриптов (scriptid + name)."""
+        return self._call("script.get", {"output": ["scriptid", "name"]})
+
+    def get_script(self, scriptid: str) -> dict[str, Any]:
+        """
+        Один скрипт (script.get). Пароли (password) для типов SSH/Telnet, где
+        приходят непустыми, маскируются в SECRET_PLACEHOLDER.
+        """
+        rows = self._call("script.get", {
+            "output": "extend",
+            "scriptids": [scriptid],
+        })
+        if not rows:
+            return {}
+        s = rows[0]
+        if s.get("password"):
+            s["password"] = SECRET_PLACEHOLDER
+        return s
