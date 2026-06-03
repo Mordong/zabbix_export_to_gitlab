@@ -42,7 +42,7 @@ EXPORT_FORMAT_YAML = "yaml"
 SECRET_PLACEHOLDER = "[SECRET]"
 
 
-def _slice_hosts_export(batch_yaml: str):
+def _slice_hosts_export(batch_yaml: str, name_to_id: dict[str, str] | None = None):
     """
     Разрезает один YAML-документ configuration.export (с несколькими хостами)
     на отдельные документы — по одному хосту в каждом.
@@ -50,10 +50,12 @@ def _slice_hosts_export(batch_yaml: str):
     Общие секции (host_groups, templates, template_groups, value_maps,
     version) копируются в каждый файл, чтобы он оставался импортируемым по
     отдельности; поле date удаляется (volatile, мешает сравнению с git).
-    Имя хоста берётся из host["host"] (техническое, уникальное).
+    Имя хоста берётся из host["host"] (техническое).
 
-    Генератор кортежей (host_name, yaml_str). При неожиданной структуре —
-    ничего не отдаёт (вызывающий не упадёт).
+    Генератор кортежей (host_name, hostid, yaml_str). hostid берётся из
+    name_to_id по техническому имени (configuration.export сам hostid не
+    отдаёт). Если карта не передана или имя в ней не найдено — hostid="".
+    При неожиданной структуре — ничего не отдаёт (вызывающий не упадёт).
     """
     try:
         doc = yaml.safe_load(batch_yaml)
@@ -68,9 +70,11 @@ def _slice_hosts_export(batch_yaml: str):
         return
 
     shared = {k: v for k, v in root.items() if k not in ("hosts", "date")}
+    name_to_id = name_to_id or {}
 
     for host in hosts:
         name = host.get("host") or host.get("name") or "host"
+        hostid = name_to_id.get(name, "")
         single = {"zabbix_export": {**shared, "hosts": [host]}}
         text = yaml.safe_dump(
             single,
@@ -79,7 +83,7 @@ def _slice_hosts_export(batch_yaml: str):
             default_flow_style=False,
             width=4096,
         )
-        yield name, text
+        yield name, hostid, text
 EXPORT_FORMAT_XML = "xml"
 EXPORT_FORMAT_JSON = "json"
 
@@ -720,12 +724,17 @@ class ZabbixAPI:
         Это снимает узкое место «1 хост = 1 вызов API»: для 15000 хостов при
         batch_size=500 будет ~30 вызовов вместо 15000.
 
-        Возвращает генератор кортежей (host_technical_name, yaml_str), где
-        yaml_str — самодостаточный документ zabbix_export с ОДНИМ хостом и
+        Возвращает генератор кортежей (host_technical_name, hostid, yaml_str),
+        где yaml_str — самодостаточный документ zabbix_export с ОДНИМ хостом и
         теми же общими секциями (version/host_groups/templates/template_groups/
         value_maps), что отдал сервер для пачки. Общие секции сохраняются в
         каждом файле, чтобы файл оставался импортируемым по отдельности; date
         вырезается (volatile-поле, не нужно в git и мешает сравнению).
+
+        hostid возвращается рядом с именем, чтобы вызывающий мог построить
+        уникальное имя файла (configuration.export сам hostid не включает, а
+        технические имена хостов в Zabbix могут схлопываться в одно имя файла
+        после очистки спецсимволов — см. <имя>_<hostid>.yaml в config_sync).
 
         :param hostids: список hostid для экспорта.
         :param batch_size: число хостов на один configuration.export.
@@ -736,6 +745,14 @@ class ZabbixAPI:
         """
         if not hostids:
             return
+        # Карта техническое_имя → hostid: configuration.export не отдаёт
+        # hostid, поэтому сопоставляем по host["host"] из лёгкого host.get.
+        wanted = set(hostids)
+        name_to_id = {
+            h["host"]: h["hostid"]
+            for h in self.list_hosts()
+            if h["hostid"] in wanted and h.get("host")
+        }
         bs = max(1, int(batch_size))
         for start in range(0, len(hostids), bs):
             chunk = hostids[start:start + bs]
@@ -743,7 +760,7 @@ class ZabbixAPI:
                 "hosts", chunk, timeout_override=export_timeout)
             if not raw:
                 continue
-            yield from _slice_hosts_export(raw)
+            yield from _slice_hosts_export(raw, name_to_id)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Infra-объекты: прокси, прокси-группы, сетевое обнаружение, обслуживание.

@@ -348,8 +348,9 @@ class TemplateSynchronizer:
             )
             if failed:
                 path_to_host = {a["file_path"]: a["_host"] for a in actions}
-                failed_hosts = {path_to_host.get(p, p) for p in failed}
-                stats.errors.extend((h, "commit failed") for h in failed_hosts)
+                failed_hosts = {path_to_host.get(p, p) for p, _ in failed}
+                stats.errors.extend(
+                    (path_to_host.get(p, p), reason) for p, reason in failed)
                 stats.created[:] = [h for h in stats.created if h not in failed_hosts]
                 stats.updated[:] = [h for h in stats.updated if h not in failed_hosts]
                 log.error("Не закоммичено шаблонов: %d", len(failed_hosts))

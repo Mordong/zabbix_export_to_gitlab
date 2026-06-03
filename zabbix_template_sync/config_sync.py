@@ -191,11 +191,11 @@ class ConfigSynchronizer:
             # Неудавшиеся файлы (пачки, не прошедшие после ретраев) —
             # в ошибки и снять из created/updated.
             if failed:
-                failed_set = set(failed)
-                stats.errors.extend((p, "commit failed") for p in failed)
+                failed_set = {p for p, _ in failed}
+                stats.errors.extend((p, reason) for p, reason in failed)
                 stats.created[:] = [p for p in stats.created if p not in failed_set]
                 stats.updated[:] = [p for p in stats.updated if p not in failed_set]
-                log.error("[%s] Не закоммичено файлов: %d", self.group, len(failed))
+                log.error("[%s] Не закоммичено файлов: %d", self.group, len(failed_set))
         else:
             for a in actions:
                 kind = "Add" if a["action"] == "create" else "Update"
@@ -287,9 +287,14 @@ def _build_core(zbx: ZabbixAPI, folder: str, cfg: SyncConfig) -> list[ExportItem
     hostids = [h["hostid"] for h in zbx.list_hosts()]
     batch_size = getattr(cfg, "host_export_batch_size", 500)
     export_timeout = getattr(cfg, "zabbix_export_timeout_sec", None)
-    for host_name, host_yaml in zbx.export_hosts_batched(
+    for host_name, hostid, host_yaml in zbx.export_hosts_batched(
             hostids, batch_size, export_timeout=export_timeout):
-        fname = safe_filename(host_name)
+        # Имя файла = <безопасное_имя>_<hostid>.yaml. hostid гарантирует
+        # уникальность: технические имена хостов в Zabbix могут схлопываться
+        # в одно имя файла после очистки спецсимволов (например, "X" и "X-"),
+        # из-за чего возникали два действия на один путь и коммит падал.
+        base = safe_filename(host_name)
+        fname = f"{base}_{hostid}" if hostid else base
         items.append(ExportItem(
             f"{folder}/hosts/{fname}.yaml",
             (lambda content=host_yaml: content),

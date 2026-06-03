@@ -394,8 +394,8 @@ def test_config_sync_groups_and_layout() -> None:
         z.get_actions.return_value = [{"actionid": "2", "name": "Report"}]
         z.get_global_macros.return_value = [{"macro": "{$X}", "value": "v", "type": "0"}]
         z.list_hosts.return_value = [
-            {"hostid": "10"},
-            {"hostid": "11"},
+            {"hostid": "10", "host": "srv-01"},
+            {"hostid": "11", "host": "db/primary"},
         ]
         _BATCH = (
             "zabbix_export:\n"
@@ -404,11 +404,17 @@ def test_config_sync_groups_and_layout() -> None:
             "    - {host: db/primary, name: DB}\n"
         )
         from zabbix_template_sync.zabbix_client import ZabbixAPI as _Z
+
+        class _Fake:
+            export_yaml_by_ids = staticmethod(
+                lambda key, ids, timeout_override=None: _BATCH if ids else "")
+            list_hosts = staticmethod(lambda: [
+                {"hostid": "10", "host": "srv-01"},
+                {"hostid": "11", "host": "db/primary"},
+            ])
         z.export_hosts_batched.side_effect = (
             lambda hostids, bs, export_timeout=None: _Z.export_hosts_batched(
-                type("X", (), {"export_yaml_by_ids": staticmethod(
-                    lambda key, ids, timeout_override=None: _BATCH if ids else "")})(),
-                hostids, bs, export_timeout=export_timeout))
+                _Fake(), hostids, bs, export_timeout=export_timeout))
         z.export_yaml_by_ids.side_effect = (
             lambda key, ids: f"zabbix_export:\n  {key}: {len(ids)}\n" if ids else "")
         z._call.side_effect = lambda m, p: (
@@ -420,7 +426,7 @@ def test_config_sync_groups_and_layout() -> None:
         "users": ["users/roles.yaml", "users/usergroups.yaml", "users/users.yaml"],
         "alerting": ["alerting/mediatypes.yaml", "alerting/actions.yaml"],
         "core": ["core/hostgroups.yaml", "core/templategroups.yaml", "core/macros.yaml",
-                 "core/hosts/srv-01.yaml", "core/hosts/db_primary.yaml"],
+                 "core/hosts/srv-01_10.yaml", "core/hosts/db_primary_11.yaml"],
     }
     for grp, files in expect.items():
         gl = MagicMock()
@@ -579,25 +585,36 @@ def test_host_batch_export_and_slicing() -> None:
         "    - {host: db/primary, name: DB}\n"
     )
 
-    # Нарезка: 3 хоста → 3 самодостаточных документа, date вырезан, кириллица.
-    sliced = dict(_slice_hosts_export(BATCH))
+    # Нарезка: 3 хоста → 3 самодостаточных документа (name, hostid, yaml),
+    # date вырезан, кириллица. hostid берётся из карты name→id.
+    name_to_id = {"srv-01": "1", "srv-02": "2", "db/primary": "3"}
+    sliced = {name: (hid, text)
+              for name, hid, text in _slice_hosts_export(BATCH, name_to_id)}
     assert sorted(sliced) == ["db/primary", "srv-01", "srv-02"], list(sliced)
+    assert sliced["srv-01"][0] == "1" and sliced["db/primary"][0] == "3"
     import yaml as _y
-    d = _y.safe_load(sliced["srv-01"])["zabbix_export"]
+    d = _y.safe_load(sliced["srv-01"][1])["zabbix_export"]
     assert "date" not in d and "host_groups" in d and len(d["hosts"]) == 1
-    assert "Сервер 01" in sliced["srv-01"]
+    assert "Сервер 01" in sliced["srv-01"][1]
 
     # Батчинг: 3 хоста, batch_size=2 → ровно 2 вызова configuration.export.
+    # (list_hosts вызывается дополнительно для карты name→id.)
     z = ZabbixAPI.__new__(ZabbixAPI)
     calls = []
     z.export_yaml_by_ids = lambda key, ids, timeout_override=None: (calls.append(list(ids)) or BATCH) if ids else ""
+    z.list_hosts = lambda: [{"hostid": "1", "host": "srv-01"},
+                            {"hostid": "2", "host": "srv-02"},
+                            {"hostid": "3", "host": "db/primary"}]
     list(z.export_hosts_batched(["1", "2", "3"], batch_size=2))
     assert calls == [["1", "2"], ["3"]], calls
 
-    # Интеграция в core: файлы на хост, slash в имени санитизирован.
+    # Интеграция в core: имя файла = <имя>_<hostid>.yaml, slash санитизирован.
     def mkz():
         zz = MagicMock(); zz.__enter__ = lambda s: zz; zz.__exit__ = lambda *a: None
-        zz.list_hosts.return_value = [{"hostid": "1"}, {"hostid": "2"}, {"hostid": "3"}]
+        zz.list_hosts.return_value = [
+            {"hostid": "1", "host": "srv-01"},
+            {"hostid": "2", "host": "srv-02"},
+            {"hostid": "3", "host": "db/primary"}]
         zz.get_global_macros.return_value = []
         zz._call.side_effect = lambda m, p: []
         zz.export_yaml_by_ids.side_effect = lambda key, ids, timeout_override=None: (BATCH if key == "hosts" and ids else "")
@@ -610,8 +627,8 @@ def test_host_batch_export_and_slicing() -> None:
          patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
         ConfigSynchronizer(_cfg(), "core").run()
     paths = sorted(a["file_path"] for a in cap["a"])
-    assert "core/hosts/srv-01.yaml" in paths
-    assert "core/hosts/db_primary.yaml" in paths, paths
+    assert "core/hosts/srv-01_1.yaml" in paths, paths
+    assert "core/hosts/db_primary_3.yaml" in paths, paths
     print("  test_host_batch_export_and_slicing: OK")
 
 
@@ -630,7 +647,7 @@ def test_chunked_commit_failure_handling() -> None:
     gl = MagicMock()
     gl.get_file_content.return_value = None
     # commit_multiple сообщает, что один файл не закоммичен.
-    gl.commit_multiple.return_value = ["users/users.yaml"]
+    gl.commit_multiple.return_value = [("users/users.yaml", "413: too large")]
     with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
          patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
         s = ConfigSynchronizer(_cfg(), "users").run()
@@ -642,6 +659,31 @@ def test_chunked_commit_failure_handling() -> None:
     _, kwargs = gl.commit_multiple.call_args
     assert "chunk_size" in kwargs and "max_retries" in kwargs
     print("  test_chunked_commit_failure_handling: OK")
+
+
+def test_host_filename_collision_resolved_by_hostid() -> None:
+    """Два хоста, схлопывающиеся в одно имя файла, → разные файлы по hostid."""
+    from zabbix_template_sync.zabbix_client import _slice_hosts_export
+    from zabbix_template_sync.utils import safe_filename
+
+    # Реальный случай из прод-лога: "...M1609M" и "...M1609M-" (хвостовой дефис).
+    BATCH = (
+        "zabbix_export:\n"
+        '  version: "7.4"\n'
+        "  hosts:\n"
+        '    - {host: "yac-vw-00131_MI1609M"}\n'
+        '    - {host: "yac-vw-00131_MI1609M-"}\n'
+    )
+    name_to_id = {"yac-vw-00131_MI1609M": "1001",
+                  "yac-vw-00131_MI1609M-": "1002"}
+    sliced = list(_slice_hosts_export(BATCH, name_to_id))
+    # имена файлов как в _build_core: <safe>_<hostid>
+    fnames = [f"{safe_filename(n)}_{hid}" for n, hid, _ in sliced]
+    assert len(set(fnames)) == 2, fnames
+    # без hostid имена бы совпали — подтверждаем, что именно hostid разводит
+    bare = [safe_filename(n) for n, _, _ in sliced]
+    assert len(set(bare)) == 1, bare
+    print("  test_host_filename_collision_resolved_by_hostid: OK")
 
 
 def main() -> int:
@@ -659,6 +701,7 @@ def main() -> int:
         test_config_sync_secret_and_skip,
         test_infra_ui_groups_layout_and_secrets,
         test_host_batch_export_and_slicing,
+        test_host_filename_collision_resolved_by_hostid,
         test_chunked_commit_failure_handling,
         test_dag_schedules,
         test_dags_register_both_branches,

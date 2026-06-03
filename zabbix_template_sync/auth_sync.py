@@ -312,8 +312,9 @@ class AuthSynchronizer:
             if failed:
                 # file_path → _file (имя файла) для статистики.
                 path_to_file = {a["file_path"]: a["_file"] for a in actions}
-                failed_files = {path_to_file.get(p, p) for p in failed}
-                stats.errors.extend((f, "commit failed") for f in failed_files)
+                failed_files = {path_to_file.get(p, p) for p, _ in failed}
+                stats.errors.extend(
+                    (path_to_file.get(p, p), reason) for p, reason in failed)
                 stats.created[:] = [f for f in stats.created if f not in failed_files]
                 stats.updated[:] = [f for f in stats.updated if f not in failed_files]
                 log.error("Не закоммичено auth-файлов: %d", len(failed_files))

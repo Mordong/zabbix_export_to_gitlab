@@ -22,6 +22,15 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+def _short_reason(err: str, limit: int = 200) -> str:
+    """
+    Ужимает текст ошибки коммита до короткой причины для записи в stats.errors:
+    оставляет начало (там HTTP-код и суть), схлопывает переводы строк.
+    """
+    one_line = " ".join(err.split())
+    return one_line[:limit]
+
+
 class GitLabAPIError(RuntimeError):
     """Ошибка GitLab REST API."""
 
@@ -285,7 +294,7 @@ class GitLabClient:
         chunk_size: int = 150,
         max_retries: int = 3,
         retry_delay_sec: float = 2.0,
-    ) -> list[str]:
+    ) -> list[tuple[str, str]]:
         """
         Коммит нескольких файлов через /commits API, РАЗБИТЫЙ НА ПАЧКИ.
 
@@ -303,18 +312,34 @@ class GitLabClient:
         следующими пачками (для disaster-recovery важно записать максимум
         данных, а не падать на первой ошибке).
 
-        Возвращает список file_path, которые НЕ удалось закоммитить (пустой —
-        значит всё успешно). Это сознательное изменение контракта: метод
-        больше не бросает исключение на ошибке коммита, а сообщает о
-        проблемных файлах вызывающему.
+        Возвращает список кортежей (file_path, reason) для файлов, которые НЕ
+        удалось закоммитить (пустой — всё успешно). reason содержит реальную
+        причину (HTTP-код/фрагмент тела), а не общее «commit failed».
+        Это сознательное изменение контракта: метод не бросает исключение на
+        ошибке коммита, а сообщает проблемные файлы с причиной вызывающему.
         """
         if not actions:
             return []
 
+        # Дедупликация по file_path: GitLab отклоняет коммит с двумя
+        # действиями на один и тот же файл ("multiple actions on the same
+        # file"). Если по какой-то причине пришли дубли путей — оставляем
+        # последнее действие (страховка; основной фикс — уникальные имена).
+        if len({a["file_path"] for a in actions}) != len(actions):
+            dedup: dict[str, dict[str, Any]] = {}
+            for a in actions:
+                dedup[a["file_path"]] = a
+            dropped = len(actions) - len(dedup)
+            log.warning(
+                "Обнаружены дубли путей в коммите (%d) — оставляю последнее действие.",
+                dropped,
+            )
+            actions = list(dedup.values())
+
         cs = max(1, int(chunk_size))
         chunks = [actions[i:i + cs] for i in range(0, len(actions), cs)]
         total = len(chunks)
-        failed: list[str] = []
+        failed: list[tuple[str, str]] = []
 
         for idx, chunk in enumerate(chunks, start=1):
             prepared: list[dict[str, Any]] = []
@@ -339,9 +364,13 @@ class GitLabClient:
                 body["author_name"] = author_name
 
             log.info("GitLab COMMIT part %d/%d: %d action(s)", idx, total, len(chunk))
-            if not self._commit_chunk_with_retry(body, max_retries, retry_delay_sec):
-                # Пачка не прошла даже после ретраев — фиксируем её файлы и идём дальше.
-                failed.extend(a["file_path"] for a in chunk)
+            err = self._commit_chunk_with_retry(body, max_retries, retry_delay_sec)
+            if err is not None:
+                # Пачка не прошла даже после ретраев — фиксируем её файлы
+                # с реальной причиной (HTTP-код/тело) и идём дальше.
+                reason = _short_reason(err)
+                for a in chunk:
+                    failed.append((a["file_path"], reason))
 
         return failed
 
@@ -350,12 +379,13 @@ class GitLabClient:
         body: dict[str, Any],
         max_retries: int,
         retry_delay_sec: float,
-    ) -> bool:
+    ) -> str | None:
         """
-        Шлёт один чанк-коммит с ретраями. Возвращает True при успехе,
-        False — если все попытки исчерпаны.
+        Шлёт один чанк-коммит с ретраями. Возвращает None при успехе или
+        текст последней ошибки (HTTP-код/тело), если все попытки исчерпаны.
         """
         attempts = max(1, int(max_retries))
+        last_err = ""
         for attempt in range(1, attempts + 1):
             try:
                 self._request(
@@ -363,8 +393,9 @@ class GitLabClient:
                     f"/projects/{self.project_id}/repository/commits",
                     json_body=body,
                 )
-                return True
+                return None
             except Exception as e:  # noqa: BLE001
+                last_err = str(e)
                 if attempt < attempts:
                     log.warning(
                         "Коммит пачки не удался (попытка %d/%d): %s — повтор через %.1fs",
@@ -376,4 +407,4 @@ class GitLabClient:
                         "Коммит пачки не удался окончательно (%d попыток): %s",
                         attempts, e,
                     )
-        return False
+        return last_err or "unknown error"
