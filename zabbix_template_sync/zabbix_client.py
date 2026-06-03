@@ -33,6 +33,11 @@ AUDIT_RESOURCE_USERDIRECTORY = 49
 
 # Поддерживаемые форматы экспорта в Zabbix 7.x
 EXPORT_FORMAT_YAML = "yaml"
+
+# Маркер на месте секретов, которые Zabbix API не отдаёт в открытом виде
+# (значение секретного макроса/токена приходит пустым). Подставляется в
+# экспорт, чтобы при восстановлении было видно: поле есть, значение — вручную.
+SECRET_PLACEHOLDER = "[SECRET]"
 EXPORT_FORMAT_XML = "xml"
 EXPORT_FORMAT_JSON = "json"
 
@@ -545,3 +550,104 @@ class ZabbixAPI:
         except ZabbixAPIError as e:
             log.warning("Резолвинг имён через %s не удался: %s", method, e)
             return {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Disaster-recovery экспорт: объекты конфигурации для восстановления.
+    # Где Zabbix поддерживает configuration.export — используем его (нативный
+    # импортируемый YAML); остальное — *.get + ручная сериализация в YAML.
+    # Секреты Zabbix API не отдаёт; где значение приходит пустым — подставляем
+    # маркер SECRET_PLACEHOLDER, чтобы в файле было видно, что поле есть, но
+    # его значение нужно восстановить вручную.
+    # ──────────────────────────────────────────────────────────────────────────
+    def get_roles(self) -> list[dict[str, Any]]:
+        """Роли пользователей (role.get) с правилами доступа (UI/API/модули)."""
+        return self._call("role.get", {
+            "output": "extend",
+            "selectRules": "extend",
+        })
+
+    def get_usergroups(self) -> list[dict[str, Any]]:
+        """
+        Группы пользователей (usergroup.get) с правами на host groups,
+        template groups и tag-фильтрами. На этих правах держится видимость
+        для LDAP-провижненных пользователей.
+        """
+        return self._call("usergroup.get", {
+            "output": "extend",
+            "selectHostGroupRights": "extend",
+            "selectTemplateGroupRights": "extend",
+            "selectTagFilters": "extend",
+            "selectUsers": ["userid", "username"],
+        })
+
+    def get_users(self) -> list[dict[str, Any]]:
+        """
+        Пользователи (user.get) — в т.ч. локальные, которые НЕ пересоздаются
+        LDAP-провижнингом. Пароли API не отдаёт (поля passwd в ответе нет),
+        поэтому маскировать нечего — факт отсутствия пароля отмечается в
+        документации, не в данных.
+        """
+        return self._call("user.get", {
+            "output": "extend",
+            "selectUsrgrps": ["usrgrpid", "name"],
+            "selectRole": ["roleid", "name"],
+            "selectMedias": "extend",
+        })
+
+    def get_global_macros(self) -> list[dict[str, Any]]:
+        """
+        Глобальные макросы (usermacro.get globalmacro=True). Секретные макросы
+        (type=1) приходят с пустым value — подставляем SECRET_PLACEHOLDER.
+        """
+        macros = self._call("usermacro.get", {
+            "globalmacro": True,
+            "output": "extend",
+        })
+        for m in macros:
+            # type: 0=text, 1=secret, 2=vault
+            if str(m.get("type", "0")) == "1" and not m.get("value"):
+                m["value"] = SECRET_PLACEHOLDER
+        return macros
+
+    def get_actions(self) -> list[dict[str, Any]]:
+        """
+        Действия (action.get): условия и операции оповещений/эскалаций.
+        Включает trigger/discovery/autoregistration/internal/service actions.
+        """
+        return self._call("action.get", {
+            "output": "extend",
+            "selectOperations": "extend",
+            "selectRecoveryOperations": "extend",
+            "selectUpdateOperations": "extend",
+            "selectFilter": "extend",
+        })
+
+    def export_yaml_by_ids(self, option_key: str, ids: list[str]) -> str:
+        """
+        Обёртка configuration.export для произвольной группы объектов.
+
+        :param option_key: ключ в options ('hosts', 'host_groups',
+            'template_groups', 'mediaTypes' и т.п. — имена согласно API 7.x).
+        :param ids: список id объектов.
+        Возвращает YAML-строку (UTF-8). Если ids пуст — возвращает ''.
+        """
+        if not ids:
+            return ""
+        result = self._call("configuration.export", {
+            "format": EXPORT_FORMAT_YAML,
+            "options": {option_key: list(ids)},
+        })
+        if not isinstance(result, str):
+            raise ZabbixAPIError(
+                f"configuration.export ({option_key}) вернул не строку: "
+                f"{type(result).__name__}"
+            )
+        return result
+
+    def list_hosts(self) -> list[dict[str, Any]]:
+        """Лёгкий список хостов (hostid + host + name) для поимённого экспорта."""
+        return self._call("host.get", {"output": ["hostid", "host", "name"]})
+
+    def export_host_yaml(self, hostid: str) -> str:
+        """Экспортирует один хост в YAML через configuration.export."""
+        return self.export_yaml_by_ids("hosts", [hostid])

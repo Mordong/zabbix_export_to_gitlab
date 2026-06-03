@@ -2,6 +2,57 @@
 
 История правок по итогам отладочных запусков.
 
+## v1.5.0 — disaster-recovery экспорт конфигурации (users / alerting / core)
+
+Добавлен экспорт минимального набора объектов для восстановления Zabbix «с
+нуля» (ребилд серверов, потеря БД, стирание объектов) — помимо шаблонов и
+auth. Три новые группы, по папке и DAG на каждую.
+
+### Что нового
+
+- **users/** — `roles.yaml`, `usergroups.yaml` (с правами на host/template
+  groups и tag-фильтрами), `users.yaml` (включая локальных, которые НЕ
+  пересоздаются LDAP-провижнингом).
+- **alerting/** — `mediatypes.yaml` (configuration.export), `actions.yaml`
+  (условия + операции оповещений/эскалаций).
+- **core/** — `hostgroups.yaml`, `templategroups.yaml`, `macros.yaml`
+  (глобальные) + `core/hosts/<имя>.yaml` (по файлу на каждый хост через
+  configuration.export).
+- **3 новых DAG** (`zabbix_users/alerting/core_to_gitlab_<env>`): расписание
+  `0 21 * * *` (ежедневно в 21:00), **без quiet period** — любое расхождение
+  коммитится сразу.
+
+### Метод и секреты
+
+- Где Zabbix поддерживает `configuration.export` (hosts, host/template
+  groups, media types) — используется он (нативный импортируемый YAML);
+  остальное (roles, user groups, users, actions, global macros) — `*.get` +
+  `dump_yaml`.
+- Секреты API не отдаёт. Секретные макросы (type=1) с пустым значением
+  помечаются маркером `[SECRET]`. Пароли пользователей в `user.get`
+  отсутствуют как поле — восстанавливаются вручную (см. README). Токены в
+  media types Zabbix также не экспортирует.
+
+### Изменения в коде
+
+- **`zabbix_client.py`** — `get_roles`, `get_usergroups`, `get_users`,
+  `get_global_macros` (маскировка `[SECRET]`), `get_actions`;
+  `export_yaml_by_ids`, `list_hosts`, `export_host_yaml`; константа
+  `SECRET_PLACEHOLDER`.
+- **`config_sync.py`** (новый) — `ConfigSynchronizer(config, group)` с
+  декларативным описанием групп; без quiet period, hosts пофайлово, пустые
+  `configuration.export` пропускаются.
+- **`dag_factory.py`** (новый) — общая фабрика DR-DAG (чтобы не дублировать
+  инфраструктуру трижды).
+- **`dags/zabbix_{users,alerting,core}_to_gitlab.py`** (новые) — тонкие обёртки.
+
+### Совместимость
+
+- **Zabbix 7.4.5 / Airflow 3.1.2** — `configuration.export` и `*.get` в форме
+  API 7.x; новые DAG по тем же паттернам Airflow 3 (проверено: регистрация 6
+  DAG в ветках импорта SDK и legacy, schedule `0 21 * * *`).
+- Обратно-совместимо: шаблоны и auth не затронуты.
+
 ## v1.4.0 — MD-маппинг групп + новые расписания DAG
 
 ### Что нового

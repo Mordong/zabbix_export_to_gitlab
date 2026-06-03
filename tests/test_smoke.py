@@ -379,6 +379,108 @@ def test_dag_schedules() -> None:
     print("  test_dag_schedules: OK")
 
 
+def test_config_sync_groups_and_layout() -> None:
+    """DR-экспорт: три группы кладут файлы в свои папки; hosts пофайлово."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync.config_sync import ConfigSynchronizer
+
+    def mkz():
+        z = MagicMock()
+        z.__enter__ = lambda s: z
+        z.__exit__ = lambda *a: None
+        z.get_roles.return_value = [{"roleid": "3", "name": "Super admin role"}]
+        z.get_usergroups.return_value = [{"usrgrpid": "7", "name": "Admins"}]
+        z.get_users.return_value = [{"userid": "1", "username": "Admin"}]
+        z.get_actions.return_value = [{"actionid": "2", "name": "Report"}]
+        z.get_global_macros.return_value = [{"macro": "{$X}", "value": "v", "type": "0"}]
+        z.list_hosts.return_value = [
+            {"hostid": "10", "host": "srv-01", "name": "S1"},
+            {"hostid": "11", "host": "db/primary", "name": "DB"},
+        ]
+        z.export_host_yaml.side_effect = lambda hid: f"zabbix_export:\n  hosts: [{hid}]\n"
+        z.export_yaml_by_ids.side_effect = (
+            lambda key, ids: f"zabbix_export:\n  {key}: {len(ids)}\n" if ids else "")
+        z._call.side_effect = lambda m, p: (
+            [{"mediatypeid": "1"}] if m == "mediatype.get"
+            else [{"groupid": "4"}] if "group.get" in m else [])
+        return z
+
+    expect = {
+        "users": ["users/roles.yaml", "users/usergroups.yaml", "users/users.yaml"],
+        "alerting": ["alerting/mediatypes.yaml", "alerting/actions.yaml"],
+        "core": ["core/hostgroups.yaml", "core/templategroups.yaml", "core/macros.yaml",
+                 "core/hosts/srv-01.yaml", "core/hosts/db_primary.yaml"],
+    }
+    for grp, files in expect.items():
+        gl = MagicMock()
+        gl.get_file_content.return_value = None
+        cap = {}
+        gl.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap.update(a=actions)
+        with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
+             patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
+            ConfigSynchronizer(_cfg(), grp).run()
+        paths = sorted(a["file_path"] for a in cap["a"])
+        for f in files:
+            assert f in paths, (grp, f, paths)
+    print("  test_config_sync_groups_and_layout: OK")
+
+
+def test_config_sync_secret_and_skip() -> None:
+    """Секретный макрос маскируется в [SECRET]; пустой экспорт пропускается."""
+    from unittest.mock import MagicMock, patch
+    from zabbix_template_sync.config_sync import ConfigSynchronizer
+    from zabbix_template_sync.zabbix_client import ZabbixAPI, SECRET_PLACEHOLDER
+
+    # Маскировка — на уровне get_global_macros (юнит проверка логики метода)
+    z = ZabbixAPI.__new__(ZabbixAPI)
+    z._call = MagicMock(return_value=[
+        {"macro": "{$P}", "type": "0", "value": "plain"},
+        {"macro": "{$S}", "type": "1", "value": ""},
+    ])
+    macros = z.get_global_macros()
+    assert macros[1]["value"] == SECRET_PLACEHOLDER, macros
+
+    # Пустой configuration.export (нет media types) → файл не коммитится;
+    # при этом *.get-файлы (actions.yaml с пустым списком) — коммитятся.
+    def mkz():
+        zz = MagicMock(); zz.__enter__ = lambda s: zz; zz.__exit__ = lambda *a: None
+        zz.get_actions.return_value = []
+        zz.export_yaml_by_ids.side_effect = lambda key, ids: ""
+        zz._call.side_effect = lambda m, p: []  # mediatype.get → []
+        return zz
+    gl = MagicMock(); gl.get_file_content.return_value = None
+    cap = {}
+    gl.commit_multiple.side_effect = lambda actions, commit_message, **kw: cap.update(a=actions)
+    with patch("zabbix_template_sync.config_sync.GitLabClient", return_value=gl), \
+         patch("zabbix_template_sync.config_sync.ZabbixAPI", return_value=mkz()):
+        ConfigSynchronizer(_cfg(), "alerting").run()
+    paths = [a["file_path"] for a in cap.get("a", [])]
+    # mediatypes.yaml пропущен (пустой export), actions.yaml присутствует
+    assert "alerting/mediatypes.yaml" not in paths, paths
+    assert "alerting/actions.yaml" in paths, paths
+    print("  test_config_sync_secret_and_skip: OK")
+
+
+def test_config_dags_register() -> None:
+    """6 DR-DAG (3 группы x 2 среды) регистрируются, schedule 0 21 * * *."""
+    import importlib.util
+    for use_sdk in (True, False):
+        _build_fake_airflow(use_sdk)
+        for m in list(sys.modules):
+            if "to_gitlab" in m or "dag_factory" in m:
+                del sys.modules[m]
+        for g in ("users", "alerting", "core"):
+            path = os.path.join(ROOT, "dags", f"zabbix_{g}_to_gitlab.py")
+            spec = importlib.util.spec_from_file_location(f"zabbix_{g}_to_gitlab", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            ids = sorted(k for k in vars(mod) if k.startswith(f"zabbix_{g}_to_gitlab_"))
+            assert ids == [f"zabbix_{g}_to_gitlab_prod", f"zabbix_{g}_to_gitlab_test"], (g, ids)
+            for did in ids:
+                assert getattr(mod, did).kw["schedule"] == "0 21 * * *"
+    print("  test_config_dags_register: OK")
+
+
 def main() -> int:
     tests = [
         test_package_imports,
@@ -390,8 +492,11 @@ def main() -> int:
         test_csv_mapping_empty_and_fallback,
         test_md_mapping_table_and_escaping,
         test_auth_creates_csv_per_directory,
+        test_config_sync_groups_and_layout,
+        test_config_sync_secret_and_skip,
         test_dag_schedules,
         test_dags_register_both_branches,
+        test_config_dags_register,
     ]
     print(f"Running {len(tests)} smoke tests…")
     for t in tests:

@@ -113,6 +113,41 @@ Variables: `<env>_zabbix_auth_subdir` (default `auth`),
 `userdirectory.get` (и опционально `auditlog.get` для правила отсрочки).
 В Zabbix эти методы доступны роли Super admin.
 
+## Disaster-recovery экспорт конфигурации (users / alerting / core)
+
+Для восстановления Zabbix «с нуля» (ребилд серверов, потеря БД, стирание
+объектов) экспортируется минимальный набор объектов, помимо шаблонов и auth.
+Три группы — по папке и отдельному DAG на каждую:
+
+| Папка | Файлы | Метод |
+|---|---|---|
+| `users/` | `roles.yaml`, `usergroups.yaml`, `users.yaml` | `*.get` |
+| `alerting/` | `mediatypes.yaml`, `actions.yaml` | export / `*.get` |
+| `core/` | `hostgroups.yaml`, `templategroups.yaml`, `macros.yaml`, `hosts/<имя>.yaml` | configuration.export / `*.get` |
+
+Хосты выгружаются по файлу на каждый (`core/hosts/<имя>.yaml`) через
+`configuration.export` — точный импортируемый формат. Группы и media types
+тоже идут через `configuration.export`; roles, user groups, users, actions и
+глобальные макросы — через `*.get` + YAML.
+
+DAG (`zabbix_users_to_gitlab_<env>` и аналоги для alerting/core) запускаются
+**раз в сутки в 21:00** (`0 21 * * *`) **без правила отсрочки** — эти объекты
+меняются редко, любое расхождение коммитится сразу. Переиспользуются те же
+Connections и `<env>_gitlab_project_id`.
+
+**Секреты не экспортируются** (Zabbix API их не отдаёт):
+- секретные макросы (type=Secret) помечаются маркером `[SECRET]`;
+- пароли пользователей отсутствуют в `user.get` — восстанавливаются вручную;
+- токены/пароли в media types и webhook'ах также не выгружаются.
+
+Это сознательное ограничение: структура и связи восстанавливаются из git,
+а секретные значения нужно хранить в отдельном защищённом месте (vault).
+Также вне git остаются исторические данные метрик — это бэкап БД.
+
+Учётке Zabbix нужны права на `role.get`, `usergroup.get`, `user.get`,
+`mediatype.get`, `action.get`, `usermacro.get`, `hostgroup.get`,
+`templategroup.get`, `host.get` и `configuration.export` — роль Super admin.
+
 ## Поддержка кириллицы
 
 Гарантирована на каждом этапе:
